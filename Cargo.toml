@@ -1,0 +1,10 @@
+[package]
+name = "mitos-pkg"
+version = "0.1.0"
+edition = "2021"
+authors = ["Shark <babor3331@gmail.com>"]
+description = "The official package manager for MITOS"
+
+[dependencies]
+# We use the 'derive' feature to define our CLI as a Rust struct
+clap = { version = "4.4", features = ["derive"] }
