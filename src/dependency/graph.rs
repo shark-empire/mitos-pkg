@@ -80,3 +80,50 @@ impl DependencyGraph {
         Ok(order)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linear_chain_orders_dependencies_first() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("app", "libc");
+        graph.add_edge("libc", "libcore");
+
+        let order = graph.install_order().unwrap();
+        let pos = |n: &str| order.iter().position(|x| x == n).unwrap();
+
+        assert!(pos("libcore") < pos("libc"));
+        assert!(pos("libc") < pos("app"));
+    }
+
+    #[test]
+    fn diamond_dependency_orders_shared_dep_once_before_both_parents() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("app", "net");
+        graph.add_edge("app", "fs");
+        graph.add_edge("net", "libc");
+        graph.add_edge("fs", "libc");
+
+        let order = graph.install_order().unwrap();
+        assert_eq!(order.iter().filter(|n| n.as_str() == "libc").count(), 1);
+
+        let pos = |n: &str| order.iter().position(|x| x == n).unwrap();
+        assert!(pos("libc") < pos("net"));
+        assert!(pos("libc") < pos("fs"));
+    }
+
+    #[test]
+    fn cycle_is_rejected() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge("a", "b");
+        graph.add_edge("b", "c");
+        graph.add_edge("c", "a");
+
+        assert!(matches!(
+            graph.install_order(),
+            Err(PkgError::CircularDependency(_))
+        ));
+    }
+}
