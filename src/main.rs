@@ -1,49 +1,70 @@
-use clap::{Parser, Subcommand};
+mod cli;
+mod config;
+mod database;
+mod dependency;
+mod error;
+mod install;
+mod package;
+mod repository;
+mod security;
+mod service;
 
-#[derive(Parser)]
-#[command(name = "mitos-pkg")]
-#[command(about = "MITOS Package Manager - Handles software installation", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
+use clap::Parser;
+use cli::{Cli, Commands};
+use config::Config;
+use service::PackageService;
+use std::path::PathBuf;
+use std::process::ExitCode;
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Install a new package
-    Install {
-        /// The name of the package to install
-        package_name: String,
-    },
-    /// Remove an installed package
-    Remove {
-        /// The name of the package to remove
-        package_name: String,
-    },
-    /// List all installed packages
-    List,
-}
-
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    match &cli.command {
-        Commands::Install { package_name } => {
-            println!("mitos-pkg: Resolving dependencies for '{}'...", package_name);
-            // TODO: Download package tarball, verify cryptographic signature, extract to /
-            println!("mitos-pkg: Successfully installed {}.", package_name);
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(Config::DEFAULT_PATH));
+    let mut config = match Config::load_or_default(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("mitos-pkg: failed to load config: {e}");
+            return ExitCode::FAILURE;
         }
-        Commands::Remove { package_name } => {
-            println!("mitos-pkg: Locating installed files for '{}'...", package_name);
-            // TODO: Read package manifest from /var/lib/mitos-pkg/, delete files, update DB
-            println!("mitos-pkg: Successfully removed {}.", package_name);
+    };
+    if let Some(root) = cli.root {
+        config.install_root = root;
+    }
+
+    let mut service = match PackageService::open(config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("mitos-pkg: failed to initialize: {e}");
+            return ExitCode::FAILURE;
         }
+    };
+
+    let result = match &cli.command {
+        Commands::Install { package_name } => service.install(package_name),
+        Commands::Remove { package_name } => service.remove(package_name),
         Commands::List => {
-            println!("mitos-pkg: Installed packages:");
-            // TODO: Parse the local database and print installed packages
-            println!("  - mitos-init (v0.1.0)");
-            println!("  - mitos-shell (v0.1.0)");
-            println!("  - mitos-utils (v0.1.0)");
+            for (name, pkg) in service.list() {
+                println!("{name} {}", pkg.version);
+            }
+            Ok(())
+        }
+        Commands::Search { query } => {
+            for meta in service.search(query) {
+                println!("{} {} - {}", meta.name, meta.version, meta.description);
+            }
+            Ok(())
+        }
+        Commands::Update => service.update(),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("mitos-pkg: {e}");
+            ExitCode::FAILURE
         }
     }
 }
