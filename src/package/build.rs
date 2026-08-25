@@ -69,8 +69,7 @@ pub fn build_package(
         Some(seed) => {
             if spec.signer.is_none() {
                 return Err(PkgError::InvalidManifest(
-                    "pkg.json has no \"signer\" set — add one before using --sign-with"
-                        .to_string(),
+                    "pkg.json has no \"signer\" set — add one before using --sign-with".to_string(),
                 ));
             }
             let sig = signature::sign(seed, payload_sha256.as_bytes());
@@ -80,8 +79,7 @@ pub fn build_package(
     };
 
     std::fs::create_dir_all(output_dir)?;
-    let archive_path =
-        output_dir.join(format::package_filename(&manifest.name, &manifest.version));
+    let archive_path = output_dir.join(format::package_filename(&manifest.name, &manifest.version));
     write_archive(&archive_path, &manifest, &payload_dir)?;
 
     Ok(BuildOutput {
