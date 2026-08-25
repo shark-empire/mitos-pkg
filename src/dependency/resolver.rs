@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 /// The result of resolving one package's dependency tree: every package
 /// that still needs installing, in the order they must be installed so
 /// each one's dependencies are already in place.
+#[derive(Debug)]
 pub struct InstallPlan {
     pub order: Vec<PackageMetadata>,
 }
