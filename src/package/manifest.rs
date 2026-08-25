@@ -25,11 +25,20 @@ pub struct Manifest {
     /// time is whatever `package::archive::extract_payload` actually wrote).
     #[serde(default)]
     pub files: Vec<String>,
-    pub size_bytes: u64,
-    /// SHA-256 of the whole `.mpkg` archive, hex-encoded.
-    pub sha256: String,
+    /// Aggregate SHA-256 over every file in `payload/`, computed by
+    /// `security::checksum::hash_payload_dir` at build time and re-checked
+    /// after extraction. Deliberately *not* a hash of the whole `.mpkg`
+    /// archive: that value would have to include this manifest, which
+    /// would have to include that value — self-referential and impossible
+    /// to satisfy. The whole-archive checksum used to verify a download
+    /// before it's even opened lives in `repository::metadata::PackageMetadata`
+    /// instead, published separately (the same split real repositories use:
+    /// e.g. a package's own control data vs. its entry in the sync index).
+    pub payload_sha256: String,
     /// Name of the signer whose key must be in the local `KeyStore` for
     /// this package to be considered trusted. `None` means unsigned.
+    /// What actually gets signed is `payload_sha256` (see
+    /// `package::signature::verify_package`).
     #[serde(default)]
     pub signer: Option<String>,
 }
