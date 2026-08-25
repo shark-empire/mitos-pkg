@@ -26,7 +26,7 @@ impl<'a> Resolver<'a> {
     /// Packages already installed at any version are treated as already
     /// satisfied and left out of the returned plan — mitos-pkg does not
     /// currently upgrade transitively pulled-in dependencies on install,
-    /// only on an explicit future `upgrade` command.
+    /// only on an explicit `upgrade` command.
     pub fn resolve_install(&self, root_name: &str) -> Result<InstallPlan> {
         let mut graph = DependencyGraph::new();
         let mut resolved: HashMap<String, PackageMetadata> = HashMap::new();
@@ -34,11 +34,13 @@ impl<'a> Resolver<'a> {
 
         self.visit(root_name, None, &mut graph, &mut resolved, &mut visiting)?;
 
-        let order = graph
+        let order: Vec<PackageMetadata> = graph
             .install_order()?
             .into_iter()
             .filter_map(|name| resolved.remove(&name))
             .collect();
+
+        self.check_conflicts(&order)?;
 
         Ok(InstallPlan { order })
     }
@@ -73,15 +75,25 @@ impl<'a> Resolver<'a> {
             .clone();
 
         for dep in &candidate.dependencies {
-            self.index
-                .best_match(&dep.name, &dep.version_req)
-                .ok_or_else(|| {
-                    PkgError::DependencyConflict(format!(
-                        "no version of '{}' satisfies '{}' required by '{}'",
-                        dep.name, dep.version_req, name
-                    ))
-                })?;
-            self.visit(&dep.name, Some(name), graph, resolved, visiting)?;
+            // A dependency can be satisfied either by a real package at a
+            // matching version, or — if no version of that exact name
+            // matches — by whatever package declares it as a virtual
+            // `provides`. Either way we recurse on the *real* package
+            // name, since that's what actually needs installing.
+            let resolved_name = match self.index.best_match(&dep.name, &dep.version_req) {
+                Some(_) => dep.name.clone(),
+                None => self
+                    .index
+                    .find_provider(&dep.name)
+                    .map(|provider| provider.name.clone())
+                    .ok_or_else(|| {
+                        PkgError::DependencyConflict(format!(
+                            "no version of '{}' satisfies '{}' required by '{}'",
+                            dep.name, dep.version_req, name
+                        ))
+                    })?,
+            };
+            self.visit(&resolved_name, Some(name), graph, resolved, visiting)?;
         }
 
         visiting.remove(name);
@@ -89,8 +101,47 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
+    /// Fails fast if anything in `plan` conflicts with an already-installed
+    /// package, with another package in the same plan, or vice versa (an
+    /// installed package that conflicts with something we're about to
+    /// add). Real package managers (dpkg, pacman) check this before
+    /// touching disk — a conflict discovered mid-transaction is much
+    /// harder to walk back cleanly.
+    fn check_conflicts(&self, plan: &[PackageMetadata]) -> Result<()> {
+        for candidate in plan {
+            for conflict in &candidate.conflicts {
+                if self.installed.is_installed(conflict) {
+                    return Err(PkgError::DependencyConflict(format!(
+                        "'{}' conflicts with already-installed '{}'",
+                        candidate.name, conflict
+                    )));
+                }
+                if plan.iter().any(|p| &p.name == conflict) {
+                    return Err(PkgError::DependencyConflict(format!(
+                        "'{}' conflicts with '{}', both required by this install",
+                        candidate.name, conflict
+                    )));
+                }
+            }
+            for (installed_name, installed_pkg) in self.installed.all() {
+                if installed_pkg.conflicts.iter().any(|c| c == &candidate.name) {
+                    return Err(PkgError::DependencyConflict(format!(
+                        "installed package '{}' conflicts with '{}'",
+                        installed_name, candidate.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Installed packages that directly depend on `name` — i.e. what would
     /// break if `name` were removed right now.
+    ///
+    /// Known limitation: if a package depends on `name` only via a virtual
+    /// `provides` (rather than naming it directly), this won't catch it —
+    /// `InstalledPackage::dependencies` stores the dependency exactly as
+    /// declared, not the concrete package it resolved to.
     pub fn dependents_of(&self, name: &str) -> Vec<String> {
         self.installed
             .all()
@@ -98,5 +149,83 @@ impl<'a> Resolver<'a> {
             .filter(|(_, pkg)| pkg.dependencies.iter().any(|d| d.name == name))
             .map(|(n, _)| n.clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::packages::InstalledPackage;
+    use semver::Version;
+
+    fn meta(name: &str, version: &str) -> PackageMetadata {
+        PackageMetadata {
+            name: name.to_string(),
+            version: Version::parse(version).unwrap(),
+            description: String::new(),
+            dependencies: Vec::new(),
+            provides: Vec::new(),
+            conflicts: Vec::new(),
+            url: String::new(),
+            sha256: String::new(),
+            signature: None,
+            size_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn virtual_dependency_resolves_via_provides() {
+        use crate::dependency::version::Dependency;
+        use semver::VersionReq;
+
+        let mut app = meta("app", "1.0.0");
+        app.dependencies.push(Dependency {
+            name: "mitos-libc".to_string(),
+            version_req: VersionReq::parse("*").unwrap(),
+        });
+
+        let mut libc_impl = meta("mitos-libc-musl", "0.3.0");
+        libc_impl.provides.push("mitos-libc".to_string());
+
+        let mut index = RepositoryIndex::default();
+        index.packages.insert("app".to_string(), vec![app]);
+        index
+            .packages
+            .insert("mitos-libc-musl".to_string(), vec![libc_impl]);
+
+        let installed = InstalledDb::default();
+        let plan = Resolver::new(&index, &installed)
+            .resolve_install("app")
+            .unwrap();
+
+        let names: Vec<&str> = plan.order.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"mitos-libc-musl"));
+        assert!(names.contains(&"app"));
+    }
+
+    #[test]
+    fn conflicting_package_is_rejected() {
+        let mut app = meta("app", "1.0.0");
+        app.conflicts.push("legacy-app".to_string());
+
+        let mut index = RepositoryIndex::default();
+        index.packages.insert("app".to_string(), vec![app]);
+
+        let mut installed = InstalledDb::default();
+        installed.insert(InstalledPackage {
+            name: "legacy-app".to_string(),
+            version: Version::parse("0.9.0").unwrap(),
+            description: String::new(),
+            dependencies: Vec::new(),
+            provides: Vec::new(),
+            conflicts: Vec::new(),
+            installed_files: Vec::new(),
+            explicit: true,
+        });
+
+        let err = Resolver::new(&index, &installed)
+            .resolve_install("app")
+            .unwrap_err();
+        assert!(matches!(err, PkgError::DependencyConflict(_)));
     }
 }
