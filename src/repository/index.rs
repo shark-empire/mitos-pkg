@@ -29,7 +29,10 @@ impl RepositoryIndex {
 
     /// The newest known version of `name`, regardless of any requirement.
     pub fn latest(&self, name: &str) -> Option<&PackageMetadata> {
-        self.packages.get(name)?.iter().max_by_key(|m| m.version.clone())
+        self.packages
+            .get(name)?
+            .iter()
+            .max_by_key(|m| m.version.clone())
     }
 
     /// The newest version of `name` that satisfies `req`.
