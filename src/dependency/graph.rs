@@ -44,7 +44,10 @@ impl DependencyGraph {
         for (node, deps) in &self.edges {
             for dep in deps {
                 *in_degree.entry(node.as_str()).or_insert(0) += 1;
-                dependents.entry(dep.as_str()).or_default().push(node.as_str());
+                dependents
+                    .entry(dep.as_str())
+                    .or_default()
+                    .push(node.as_str());
             }
         }
 

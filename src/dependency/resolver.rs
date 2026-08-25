@@ -73,12 +73,14 @@ impl<'a> Resolver<'a> {
             .clone();
 
         for dep in &candidate.dependencies {
-            self.index.best_match(&dep.name, &dep.version_req).ok_or_else(|| {
-                PkgError::DependencyConflict(format!(
-                    "no version of '{}' satisfies '{}' required by '{}'",
-                    dep.name, dep.version_req, name
-                ))
-            })?;
+            self.index
+                .best_match(&dep.name, &dep.version_req)
+                .ok_or_else(|| {
+                    PkgError::DependencyConflict(format!(
+                        "no version of '{}' satisfies '{}' required by '{}'",
+                        dep.name, dep.version_req, name
+                    ))
+                })?;
             self.visit(&dep.name, Some(name), graph, resolved, visiting)?;
         }
 
