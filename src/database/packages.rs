@@ -5,21 +5,26 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// A package as recorded in the local install database. `dependencies` and
-/// `installed_files` are snapshots taken at install time (from the
-/// manifest and from what `package::archive::extract_payload` actually
-/// wrote) so that removal and dependency checks never need to re-resolve
-/// or re-read an archive that may no longer be cached.
+/// A package as recorded in the local install database. Most fields are
+/// snapshots taken at install time (from the manifest and from what
+/// `package::archive::extract_payload` actually wrote), so that removal,
+/// `info`, and dependency/conflict checks never need to re-resolve or
+/// re-read an archive that may no longer be cached.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledPackage {
     pub name: String,
     pub version: Version,
+    #[serde(default)]
+    pub description: String,
     pub dependencies: Vec<Dependency>,
+    #[serde(default)]
+    pub provides: Vec<String>,
+    #[serde(default)]
+    pub conflicts: Vec<String>,
     pub installed_files: Vec<PathBuf>,
     /// True if the user asked for this package directly; false if it was
-    /// pulled in only to satisfy another package's dependency. Not yet
-    /// used for orphan cleanup, but recorded now so that a future
-    /// `autoremove` doesn't require a database migration.
+    /// pulled in only to satisfy another package's dependency. Read by
+    /// `PackageService::autoremove` to find orphaned dependencies.
     pub explicit: bool,
 }
 
