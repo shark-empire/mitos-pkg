@@ -235,7 +235,11 @@ impl PackageService {
 
         // Pull in any dependency the new version introduces that the old
         // one didn't have.
-        let new_deps: Vec<String> = manifest.dependencies.iter().map(|d| d.name.clone()).collect();
+        let new_deps: Vec<String> = manifest
+            .dependencies
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
         for dep_name in new_deps {
             if !self.packages.is_installed(&dep_name) {
                 let plan = Resolver::new(&self.index, &self.packages).resolve_install(&dep_name)?;
