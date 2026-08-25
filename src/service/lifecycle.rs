@@ -5,7 +5,7 @@ use crate::dependency::resolver::Resolver;
 use crate::error::{PkgError, Result};
 use crate::install::transaction::Transaction;
 use crate::package::{archive, format, signature as pkg_signature};
-use crate::repository::download::{download_verified, HttpFetcher};
+use crate::repository::download::{download_verified, Fetcher, HttpFetcher};
 use crate::repository::index::RepositoryIndex;
 use crate::repository::metadata::PackageMetadata;
 use crate::security::keys::KeyStore;
@@ -85,7 +85,12 @@ impl PackageService {
         Ok(())
     }
 
-    fn install_one(&mut self, fetcher: &HttpFetcher, meta: &PackageMetadata, explicit: bool) -> Result<()> {
+    fn install_one(
+        &mut self,
+        fetcher: &HttpFetcher,
+        meta: &PackageMetadata,
+        explicit: bool,
+    ) -> Result<()> {
         let dest = self
             .config
             .download_cache_path(&format::package_filename(&meta.name, &meta.version));
@@ -96,7 +101,11 @@ impl PackageService {
         let manifest = archive::read_manifest(&dest)?;
         pkg_signature::verify_package(&dest, &manifest, &self.keystore, meta.signature.as_deref())?;
 
-        let mut tx = Transaction::new(&self.config.install_root, &mut self.packages, &mut self.files);
+        let mut tx = Transaction::new(
+            &self.config.install_root,
+            &mut self.packages,
+            &mut self.files,
+        );
         tx.install(&dest, &manifest, explicit)
     }
 
@@ -114,7 +123,11 @@ impl PackageService {
             return Err(PkgError::RequiredByOthers(name.to_string(), dependents));
         }
 
-        let mut tx = Transaction::new(&self.config.install_root, &mut self.packages, &mut self.files);
+        let mut tx = Transaction::new(
+            &self.config.install_root,
+            &mut self.packages,
+            &mut self.files,
+        );
         tx.remove(name)
     }
 
