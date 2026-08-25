@@ -44,6 +44,20 @@ impl RepositoryIndex {
             .max_by_key(|m| m.version.clone())
     }
 
+    /// The newest package that declares `virtual_name` in its `provides`
+    /// list — used when a dependency names a capability rather than a
+    /// concrete package (e.g. depending on "mitos-libc" being satisfiable
+    /// by either "mitos-libc-musl" or "mitos-libc-glibc"). Deliberately
+    /// unversioned, matching how most real package managers treat
+    /// `provides`/`Provides:` entries.
+    pub fn find_provider(&self, virtual_name: &str) -> Option<&PackageMetadata> {
+        self.packages
+            .values()
+            .flatten()
+            .filter(|m| m.provides.iter().any(|p| p == virtual_name))
+            .max_by_key(|m| m.version.clone())
+    }
+
     /// Case-insensitive substring search over name and description,
     /// returning each matching package's newest version.
     pub fn search(&self, query: &str) -> Vec<&PackageMetadata> {
