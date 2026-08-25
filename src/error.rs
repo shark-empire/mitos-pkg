@@ -50,6 +50,9 @@ pub enum PkgError {
 
     #[error("invalid package manifest: {0}")]
     InvalidManifest(String),
+
+    #[error("another mitos-pkg operation appears to be in progress (lock file: {0})")]
+    Locked(std::path::PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, PkgError>;
