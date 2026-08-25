@@ -131,7 +131,9 @@ fn main() -> ExitCode {
 }
 
 fn run_build(source: &Path, output: Option<&Path>, sign_with: Option<&Path>) -> ExitCode {
-    let output_dir = output.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let output_dir = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let sign_seed = match sign_with {
         Some(path) => match load_seed(path) {
