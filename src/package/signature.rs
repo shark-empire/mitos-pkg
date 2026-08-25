@@ -34,8 +34,7 @@ pub fn verify_package(
 }
 
 fn decode_signature(hex_str: &str, signer: &str) -> Result<[u8; 64]> {
-    let bytes =
-        hex::decode(hex_str).map_err(|_| PkgError::InvalidSignature(signer.to_string()))?;
+    let bytes = hex::decode(hex_str).map_err(|_| PkgError::InvalidSignature(signer.to_string()))?;
     bytes
         .try_into()
         .map_err(|_| PkgError::InvalidSignature(signer.to_string()))
