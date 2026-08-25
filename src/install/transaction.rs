@@ -16,7 +16,11 @@ pub struct Transaction<'a> {
 }
 
 impl<'a> Transaction<'a> {
-    pub fn new(install_root: &'a Path, packages: &'a mut InstalledDb, files: &'a mut FileDb) -> Self {
+    pub fn new(
+        install_root: &'a Path,
+        packages: &'a mut InstalledDb,
+        files: &'a mut FileDb,
+    ) -> Self {
         Self {
             install_root,
             packages,
@@ -28,7 +32,12 @@ impl<'a> Transaction<'a> {
     /// already passed `package::signature::verify_package`; this method
     /// does no trust checks of its own, only filesystem + database
     /// bookkeeping.
-    pub fn install(&mut self, archive_path: &Path, manifest: &Manifest, explicit: bool) -> Result<()> {
+    pub fn install(
+        &mut self,
+        archive_path: &Path,
+        manifest: &Manifest,
+        explicit: bool,
+    ) -> Result<()> {
         let written = extractor::extract_into(archive_path, self.install_root)?;
 
         if let Err(e) = self.files.check_no_conflicts(&written, &manifest.name) {
