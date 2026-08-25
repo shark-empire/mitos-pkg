@@ -29,3 +29,29 @@ pub fn verify(data: &[u8], expected_hex: &str, context: &str) -> Result<()> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_is_stable_and_hex_encoded() {
+        let digest = hash_bytes(b"mitos");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(digest, hash_bytes(b"mitos"));
+    }
+
+    #[test]
+    fn verify_accepts_matching_checksum() {
+        let expected = hash_bytes(b"payload bytes");
+        assert!(verify(b"payload bytes", &expected, "test-pkg").is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_mismatched_checksum() {
+        let wrong = hash_bytes(b"something else");
+        let err = verify(b"payload bytes", &wrong, "test-pkg").unwrap_err();
+        assert!(matches!(err, PkgError::ChecksumMismatch { .. }));
+    }
+}
