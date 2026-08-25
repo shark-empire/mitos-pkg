@@ -3,6 +3,7 @@ use crate::database::packages::{InstalledDb, InstalledPackage};
 use crate::error::{PkgError, Result};
 use crate::install::{extractor, rollback};
 use crate::package::manifest::Manifest;
+use crate::security::checksum;
 use std::path::Path;
 
 /// A single install or remove, applied so that on any failure the
@@ -45,11 +46,35 @@ impl<'a> Transaction<'a> {
             return Err(e);
         }
 
+        // Re-hash what actually landed on disk against what the manifest
+        // claims, independent of the archive-level checksum already
+        // checked before extraction (see `package::signature::verify_package`)
+        // — this catches corruption or tampering introduced during
+        // extraction itself, not just in transit.
+        match checksum::hash_files(self.install_root, &written) {
+            Ok(actual) if actual.eq_ignore_ascii_case(&manifest.payload_sha256) => {}
+            Ok(actual) => {
+                rollback::undo_install(self.install_root, &written);
+                return Err(PkgError::ChecksumMismatch {
+                    name: manifest.name.clone(),
+                    expected: manifest.payload_sha256.clone(),
+                    actual,
+                });
+            }
+            Err(e) => {
+                rollback::undo_install(self.install_root, &written);
+                return Err(e);
+            }
+        }
+
         self.files.claim(&written, &manifest.name);
         self.packages.insert(InstalledPackage {
             name: manifest.name.clone(),
             version: manifest.version.clone(),
+            description: manifest.description.clone(),
             dependencies: manifest.dependencies.clone(),
+            provides: manifest.provides.clone(),
+            conflicts: manifest.conflicts.clone(),
             installed_files: written,
             explicit,
         });
