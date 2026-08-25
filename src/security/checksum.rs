@@ -131,11 +131,8 @@ mod tests {
         std::fs::write(dir.join("readme"), b"a readme").unwrap();
 
         let via_walk = hash_payload_dir(&dir).unwrap();
-        let via_list = hash_files(
-            &dir,
-            &[PathBuf::from("bin/hello"), PathBuf::from("readme")],
-        )
-        .unwrap();
+        let via_list =
+            hash_files(&dir, &[PathBuf::from("bin/hello"), PathBuf::from("readme")]).unwrap();
 
         assert_eq!(via_walk, via_list);
 
