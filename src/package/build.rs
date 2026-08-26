@@ -2,7 +2,7 @@ use crate::error::{PkgError, Result};
 use crate::package::format::{self, MANIFEST_FILE_NAME, PAYLOAD_DIR};
 use crate::package::manifest::Manifest;
 use crate::package::spec::PackageSpec;
-use crate::security::{checksum, signature};
+use crate::security::{checksum, signature as sec_signature};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::fs::File;
@@ -72,7 +72,7 @@ pub fn build_package(
                     "pkg.json has no \"signer\" set — add one before using --sign-with".to_string(),
                 ));
             }
-            let sig = signature::sign(seed, payload_sha256.as_bytes());
+            let sig = sec_signature::sign(seed, payload_sha256.as_bytes());
             Some(hex::encode(sig))
         }
         None => None,
