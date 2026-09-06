@@ -26,6 +26,13 @@ pub struct InstalledPackage {
     /// pulled in only to satisfy another package's dependency. Read by
     /// `PackageService::autoremove` to find orphaned dependencies.
     pub explicit: bool,
+    /// True if the user pinned this package with `mitos-pkg hold`,
+    /// exempting it from `upgrade` (mirrors `apt-mark hold` / `dnf
+    /// versionlock` / pacman's `IgnorePkg`). `#[serde(default)]` so a
+    /// database written before this field existed still loads cleanly,
+    /// with every pre-existing package treated as unheld.
+    #[serde(default)]
+    pub held: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -64,6 +71,13 @@ impl InstalledDb {
 
     pub fn get(&self, name: &str) -> Option<&InstalledPackage> {
         self.packages.get(name)
+    }
+
+    /// Mutable access to an installed package's record — used by `hold`/
+    /// `unhold` to flip `InstalledPackage::held` in place without a
+    /// clone-mutate-reinsert round trip.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut InstalledPackage> {
+        self.packages.get_mut(name)
     }
 
     pub fn all(&self) -> &HashMap<String, InstalledPackage> {
