@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::database::files::FileDb;
 use crate::database::packages::{InstalledDb, InstalledPackage};
 use crate::dependency::resolver::Resolver;
-use crate::dependency::version::Dependency;
+use crate::dependency::version::{parse_pinned, Dependency};
 use crate::error::{PkgError, Result};
 use crate::install::transaction::Transaction;
 use crate::package::{archive, format, manifest::Manifest, signature as pkg_signature};
@@ -38,6 +38,7 @@ pub struct InfoView {
     pub conflicts: Vec<String>,
     pub installed: bool,
     pub explicit: Option<bool>,
+    pub held: Option<bool>,
 }
 
 impl PackageService {
@@ -60,12 +61,31 @@ impl PackageService {
 
     /// Refreshes the local index cache from every configured repository
     /// and merges them into one in-memory + on-disk index.
+    ///
+    /// A repository configured with a `signer` (see `config::RepoSource`)
+    /// must also serve `{url}.sig` — a detached signature over the raw
+    /// index bytes — or its packages are rejected outright: an index that
+    /// claims to be signed but can't produce a valid signature is treated
+    /// the same as a tampered one, not silently downgraded to unsigned.
     pub fn update(&mut self) -> Result<()> {
         let fetcher = HttpFetcher;
         let mut merged = RepositoryIndex::default();
 
-        for repo_url in &self.config.repositories {
-            let data = fetcher.fetch(repo_url)?;
+        for repo in &self.config.repositories {
+            let data = fetcher.fetch(repo.url())?;
+
+            if let Some(signer) = repo.signer() {
+                let sig_url = format!("{}.sig", repo.url());
+                let sig_bytes = fetcher.fetch(&sig_url).map_err(|_| {
+                    PkgError::InvalidSignature(format!(
+                        "repository '{}' requires a signature from '{signer}' but its signature at {sig_url} could not be fetched",
+                        repo.url()
+                    ))
+                })?;
+                let sig_hex = String::from_utf8_lossy(&sig_bytes);
+                pkg_signature::verify_index(&data, sig_hex.trim(), signer, &self.keystore)?;
+            }
+
             let remote: RepositoryIndex = serde_json::from_slice(&data)?;
             for (name, versions) in remote.packages {
                 merged.packages.entry(name).or_default().extend(versions);
@@ -108,25 +128,25 @@ impl PackageService {
         Ok((dest, manifest))
     }
 
-    /// Resolves `name`'s dependency tree, downloads + verifies + installs
-    /// each package that isn't already present, in dependency order. If
-    /// any package in the chain fails to verify or install, packages
-    /// already committed earlier in this call stay installed — mitos-pkg
-    /// does not currently roll back an entire multi-package plan, only the
-    /// single package transaction that failed (see `Transaction::install`).
-    pub fn install(&mut self, name: &str) -> Result<()> {
+    /// Resolves `spec`'s dependency tree, downloads + verifies + installs
+    /// each package that isn't already present, in dependency order.
+    /// `spec` is either a bare package name or `name@version` to pin an
+    /// exact version (see `dependency::version::parse_pinned`). If any
+    /// package in the chain fails to verify or install, packages already
+    /// committed earlier in this call stay installed — mitos-pkg does not
+    /// currently roll back an entire multi-package plan, only the single
+    /// package transaction that failed (see `Transaction::install`).
+    pub fn install(&mut self, spec: &str) -> Result<()> {
         let _lock = Lock::acquire(&self.config.db_dir)?;
+        let (name, req) = parse_pinned(spec)?;
 
-        if let Some(existing) = self.packages.get(name) {
-            return Err(PkgError::AlreadyInstalled(
-                name.to_string(),
-                existing.version.to_string(),
-            ));
+        if let Some(existing) = self.packages.get(&name) {
+            return Err(PkgError::AlreadyInstalled(name, existing.version.to_string()));
         }
 
         let plan = {
             let resolver = Resolver::new(&self.index, &self.packages);
-            resolver.resolve_install(name)?
+            resolver.resolve_install_req(&name, &req)?
         };
 
         let fetcher = HttpFetcher;
@@ -148,25 +168,55 @@ impl PackageService {
             &mut self.packages,
             &mut self.files,
         );
-        tx.install(&dest, &manifest, explicit)
+        // A freshly-pulled-in package is never held — there's nothing to
+        // carry forward yet (see `upgrade_one` for the one path that
+        // preserves an existing hold).
+        tx.install(&dest, &manifest, explicit, false)
     }
 
-    /// Removes `name`, refusing if any other installed package still
-    /// depends on it (use `autoremove` to clean up orphaned dependencies
-    /// instead — cascading a direct `remove` silently is exactly the kind
-    /// of surprise a package manager shouldn't spring on you).
-    pub fn remove(&mut self, name: &str) -> Result<()> {
+    /// Removes `name`. Refuses if any other installed package still
+    /// depends on it, unless `cascade` is set, in which case every such
+    /// dependent is removed first (deepest first), then `name` — mitos-
+    /// pkg's equivalent of `apt remove` needing `--auto-remove` chained,
+    /// or pacman's `-Rs`. Returns every package name actually removed,
+    /// in the order they were removed.
+    pub fn remove(&mut self, name: &str, cascade: bool) -> Result<Vec<String>> {
         let _lock = Lock::acquire(&self.config.db_dir)?;
 
         if !self.packages.is_installed(name) {
             return Err(PkgError::NotInstalled(name.to_string()));
         }
 
-        let dependents = Resolver::new(&self.index, &self.packages).dependents_of(name);
-        if !dependents.is_empty() {
-            return Err(PkgError::RequiredByOthers(name.to_string(), dependents));
+        let mut removed = Vec::new();
+        if cascade {
+            self.remove_cascade(name, &mut removed)?;
+        } else {
+            let dependents = Resolver::new(&self.index, &self.packages).dependents_of(name);
+            if !dependents.is_empty() {
+                return Err(PkgError::RequiredByOthers(name.to_string(), dependents));
+            }
+            self.remove_one(name)?;
+            removed.push(name.to_string());
         }
+        Ok(removed)
+    }
 
+    fn remove_cascade(&mut self, name: &str, removed: &mut Vec<String>) -> Result<()> {
+        let dependents = Resolver::new(&self.index, &self.packages).dependents_of(name);
+        for dependent in dependents {
+            // A shared dependent may already have been removed earlier in
+            // this same cascade (e.g. two packages both pulled in the
+            // same thing that itself depended on `name`).
+            if self.packages.is_installed(&dependent) {
+                self.remove_cascade(&dependent, removed)?;
+            }
+        }
+        self.remove_one(name)?;
+        removed.push(name.to_string());
+        Ok(())
+    }
+
+    fn remove_one(&mut self, name: &str) -> Result<()> {
         let mut tx = Transaction::new(
             &self.config.install_root,
             &mut self.packages,
@@ -175,18 +225,46 @@ impl PackageService {
         tx.remove(name)
     }
 
+    /// Refuses an upgrade that would leave another installed package's
+    /// declared dependency on `name` unsatisfied. Closes a previously
+    /// documented gap: only the upgraded package's *own* new dependencies
+    /// used to be checked, never whether existing dependents could
+    /// tolerate the version bump.
+    fn check_upgrade_safe(&self, name: &str, new_version: &Version) -> Result<()> {
+        for (dependent_name, dependent) in self.packages.all() {
+            if dependent_name == name {
+                continue;
+            }
+            for dep in &dependent.dependencies {
+                let names_match = dep.name == name
+                    || self
+                        .packages
+                        .get(name)
+                        .map(|p| p.provides.iter().any(|provided| provided == &dep.name))
+                        .unwrap_or(false);
+                if names_match && !dep.matches(new_version) {
+                    return Err(PkgError::DependencyConflict(format!(
+                        "upgrading '{name}' to {new_version} would break '{dependent_name}', which requires '{} {}'",
+                        dep.name, dep.version_req
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Upgrades one named package, or every installed package if `name`
     /// is `None`, to the newest version currently in the repository
-    /// index. Returns each package actually upgraded as
-    /// `(name, old_version, new_version)`.
-    ///
-    /// Known limitation: this only checks that the *new* version's own
-    /// dependencies are met (pulling in any that are missing) — it does
-    /// not check whether upgrading breaks another installed package's
-    /// version requirement on the one being upgraded. A future version of
-    /// this could walk `Resolver::dependents_of` and re-validate their
-    /// `Dependency::matches` before committing.
-    pub fn upgrade(&mut self, name: Option<&str>) -> Result<Vec<(String, Version, Version)>> {
+    /// index. Packages pinned with `hold` are skipped when upgrading
+    /// everything; naming a held package directly is refused unless
+    /// `ignore_hold` is set (mirrors `apt-get install <held-pkg>` needing
+    /// `--allow-change-held-packages`). Returns each package actually
+    /// upgraded as `(name, old_version, new_version)`.
+    pub fn upgrade(
+        &mut self,
+        name: Option<&str>,
+        ignore_hold: bool,
+    ) -> Result<Vec<(String, Version, Version)>> {
         let _lock = Lock::acquire(&self.config.db_dir)?;
 
         let targets: Vec<String> = match name {
@@ -202,6 +280,12 @@ impl PackageService {
                 }
                 continue;
             };
+            if installed.held && !ignore_hold {
+                if name.is_some() {
+                    return Err(PkgError::PackageHeld(pkg_name));
+                }
+                continue;
+            }
             let Some(latest) = self.index.latest(&pkg_name) else {
                 continue;
             };
@@ -212,15 +296,17 @@ impl PackageService {
             let from = installed.version.clone();
             let to = latest.version.clone();
             let explicit = installed.explicit;
+            let held = installed.held;
 
-            self.upgrade_one(&pkg_name, explicit)?;
+            self.check_upgrade_safe(&pkg_name, &to)?;
+            self.upgrade_one(&pkg_name, explicit, held)?;
             upgraded.push((pkg_name, from, to));
         }
 
         Ok(upgraded)
     }
 
-    fn upgrade_one(&mut self, name: &str, explicit: bool) -> Result<()> {
+    fn upgrade_one(&mut self, name: &str, explicit: bool, held: bool) -> Result<()> {
         let latest = self
             .index
             .latest(name)
@@ -250,7 +336,9 @@ impl PackageService {
         }
 
         // Swap: remove the old payload, install the freshly-verified new
-        // one, carrying over whether it was explicitly requested.
+        // one, carrying over whether it was explicitly requested and
+        // whether it was held (a forced upgrade of a held package leaves
+        // it held, the same way apt doesn't auto-unhold on override).
         {
             let mut tx = Transaction::new(
                 &self.config.install_root,
@@ -264,7 +352,31 @@ impl PackageService {
             &mut self.packages,
             &mut self.files,
         );
-        tx.install(&dest, &manifest, explicit)
+        tx.install(&dest, &manifest, explicit, held)
+    }
+
+    /// Pins `name` so `upgrade` (without `--ignore-hold`) skips it —
+    /// mirrors `apt-mark hold` / `dnf versionlock add` / pacman's
+    /// `IgnorePkg`.
+    pub fn hold(&mut self, name: &str) -> Result<()> {
+        let _lock = Lock::acquire(&self.config.db_dir)?;
+        let pkg = self
+            .packages
+            .get_mut(name)
+            .ok_or_else(|| PkgError::NotInstalled(name.to_string()))?;
+        pkg.held = true;
+        self.packages.save()
+    }
+
+    /// Reverses `hold`, letting `upgrade` touch `name` again.
+    pub fn unhold(&mut self, name: &str) -> Result<()> {
+        let _lock = Lock::acquire(&self.config.db_dir)?;
+        let pkg = self
+            .packages
+            .get_mut(name)
+            .ok_or_else(|| PkgError::NotInstalled(name.to_string()))?;
+        pkg.held = false;
+        self.packages.save()
     }
 
     /// Removes every installed package that isn't explicitly wanted and
@@ -290,16 +402,36 @@ impl PackageService {
 
             let Some(name) = orphan else { break };
 
-            let mut tx = Transaction::new(
-                &self.config.install_root,
-                &mut self.packages,
-                &mut self.files,
-            );
-            tx.remove(&name)?;
+            self.remove_one(&name)?;
             removed.push(name);
         }
 
         Ok(removed)
+    }
+
+    /// Deletes every cached downloaded archive under the configured cache
+    /// directory (the index cache is left alone — `update` manages that)
+    /// — mitos-pkg's equivalent of `apt clean` / `pacman -Sc`. Safe to
+    /// run any time: anything actually needed again is re-downloaded and
+    /// re-verified on demand. Returns the number of bytes freed.
+    pub fn clean(&self) -> Result<u64> {
+        let downloads_dir = self.config.cache_dir.join("downloads");
+        if !downloads_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut freed = 0u64;
+        for entry in std::fs::read_dir(&downloads_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            freed += entry.metadata()?.len();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        Ok(freed)
     }
 
     pub fn list(&self) -> Vec<(&String, &InstalledPackage)> {
@@ -326,6 +458,7 @@ impl PackageService {
                 conflicts: pkg.conflicts.clone(),
                 installed: true,
                 explicit: Some(pkg.explicit),
+                held: Some(pkg.held),
             });
         }
 
@@ -343,6 +476,7 @@ impl PackageService {
             conflicts: meta.conflicts.clone(),
             installed: false,
             explicit: None,
+            held: None,
         })
     }
 }
