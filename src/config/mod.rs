@@ -1,2 +1,2 @@
 pub mod files;
-pub use files::Config;
+pub use files::{Config, RepoSource};
