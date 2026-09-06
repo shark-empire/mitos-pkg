@@ -32,12 +32,17 @@ impl<'a> Transaction<'a> {
     /// Installs one already-verified package archive. `manifest` must have
     /// already passed `package::signature::verify_package`; this method
     /// does no trust checks of its own, only filesystem + database
-    /// bookkeeping.
+    /// bookkeeping. `held` should be `false` for a fresh install; the one
+    /// caller that ever passes `true` is `PackageService::upgrade_one`
+    /// force-upgrading a held package, which carries the hold forward
+    /// rather than silently clearing it (matching `apt`: overriding a
+    /// hold once doesn't un-pin the package for next time).
     pub fn install(
         &mut self,
         archive_path: &Path,
         manifest: &Manifest,
         explicit: bool,
+        held: bool,
     ) -> Result<()> {
         let written = extractor::extract_into(archive_path, self.install_root)?;
 
@@ -77,6 +82,7 @@ impl<'a> Transaction<'a> {
             conflicts: manifest.conflicts.clone(),
             installed_files: written,
             explicit,
+            held,
         });
 
         // Persist only once in-memory state is fully consistent, so a
