@@ -1,19 +1,8 @@
-mod cli;
-mod config;
-mod database;
-mod dependency;
-mod error;
-mod install;
-mod package;
-mod repository;
-mod security;
-mod service;
-
 use clap::Parser;
-use cli::{Cli, Commands};
-use config::Config;
-use package::build;
-use service::PackageService;
+use mitos_pkg::cli::{Cli, Commands};
+use mitos_pkg::config::Config;
+use mitos_pkg::package::build;
+use mitos_pkg::service::PackageService;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -58,17 +47,33 @@ fn main() -> ExitCode {
 
     let result = match &cli.command {
         Commands::Install { package_name } => service.install(package_name),
-        Commands::Remove { package_name } => service.remove(package_name),
-        Commands::Upgrade { package_name } => {
-            service.upgrade(package_name.as_deref()).map(|upgraded| {
+        Commands::Remove {
+            package_name,
+            cascade,
+        } => service.remove(package_name, *cascade).map(|removed| {
+            for name in removed {
+                println!("removed: {name}");
+            }
+        }),
+        Commands::Upgrade {
+            package_name,
+            ignore_hold,
+        } => service
+            .upgrade(package_name.as_deref(), *ignore_hold)
+            .map(|upgraded| {
                 if upgraded.is_empty() {
                     println!("mitos-pkg: nothing to upgrade");
                 }
                 for (name, from, to) in upgraded {
                     println!("{name}: {from} -> {to}");
                 }
-            })
-        }
+            }),
+        Commands::Hold { package_name } => service
+            .hold(package_name)
+            .map(|_| println!("held: {package_name}")),
+        Commands::Unhold { package_name } => service
+            .unhold(package_name)
+            .map(|_| println!("unheld: {package_name}")),
         Commands::Autoremove => service.autoremove().map(|removed| {
             if removed.is_empty() {
                 println!("mitos-pkg: nothing to remove");
@@ -79,7 +84,11 @@ fn main() -> ExitCode {
         }),
         Commands::List => {
             for (name, pkg) in service.list() {
-                println!("{name} {}", pkg.version);
+                if pkg.held {
+                    println!("{name} {} [held]", pkg.version);
+                } else {
+                    println!("{name} {}", pkg.version);
+                }
             }
             Ok(())
         }
@@ -102,6 +111,9 @@ fn main() -> ExitCode {
                     if explicit { "yes" } else { "no" }
                 );
             }
+            if let Some(held) = info.held {
+                println!("held: {}", if held { "yes" } else { "no" });
+            }
             if !info.dependencies.is_empty() {
                 let deps: Vec<String> = info
                     .dependencies
@@ -118,6 +130,9 @@ fn main() -> ExitCode {
             }
         }),
         Commands::Update => service.update(),
+        Commands::Clean => service
+            .clean()
+            .map(|freed| println!("mitos-pkg: freed {freed} bytes")),
         Commands::Build { .. } => unreachable!("handled before service setup above"),
     };
 

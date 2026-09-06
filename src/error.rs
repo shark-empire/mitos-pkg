@@ -30,11 +30,20 @@ pub enum PkgError {
     #[error("package '{0}' not found in any configured repository")]
     PackageNotFound(String),
 
+    #[error("no version of '{name}' satisfies '{requirement}'")]
+    NoMatchingVersion { name: String, requirement: String },
+
+    #[error("invalid package specifier '{0}' (expected 'name' or 'name@version')")]
+    InvalidPackageSpec(String),
+
     #[error("package '{0}' is already installed (version {1})")]
     AlreadyInstalled(String, String),
 
     #[error("package '{0}' is not installed")]
     NotInstalled(String),
+
+    #[error("'{0}' is held — run `mitos-pkg unhold` first, or pass --ignore-hold")]
+    PackageHeld(String),
 
     #[error("dependency conflict: {0}")]
     DependencyConflict(String),
