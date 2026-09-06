@@ -44,6 +44,38 @@ pub fn verify_package(
     Ok(())
 }
 
+/// Verifies a repository index's raw bytes against a detached signature,
+/// using the same trust model as `verify_package`: the signature covers
+/// the hex SHA-256 digest of the content rather than the raw bytes
+/// themselves (so signing and verifying both go through one well-tested
+/// "hash it, then sign the hash" path), and the signer must be a key
+/// already present in the local `KeyStore`. There's no separate "repo
+/// key" concept — a signer trusted for packages is trusted for the
+/// indexes that list them too.
+///
+/// Closes a gap plain per-package signing leaves open: without this, an
+/// attacker who can replace a repository's index can point an *unsigned*
+/// package's metadata at a malicious archive and simply publish that
+/// archive's own (correct) checksum alongside it — the checksum check
+/// passes because it's checking the archive against a number the
+/// attacker also controls. Signing the index itself is the same
+/// integrity model real package managers use for their sync metadata
+/// (apt's Release/InRelease, pacman's sync db `.sig`, dnf's
+/// `repomd.xml.asc`).
+pub fn verify_index(
+    data: &[u8],
+    signature_hex: &str,
+    signer: &str,
+    keystore: &KeyStore,
+) -> Result<()> {
+    let public_key = keystore
+        .find(signer)
+        .ok_or_else(|| PkgError::UntrustedKey(signer.to_string()))?;
+    let digest = checksum::hash_bytes(data);
+    let sig_bytes = decode_signature(signature_hex, signer)?;
+    sig::verify_signature(public_key, digest.as_bytes(), &sig_bytes, signer)
+}
+
 fn decode_signature(hex_str: &str, signer: &str) -> Result<[u8; 64]> {
     let bytes = hex::decode(hex_str).map_err(|_| PkgError::InvalidSignature(signer.to_string()))?;
     bytes
