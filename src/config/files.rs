@@ -55,6 +55,12 @@ pub struct Config {
     pub trusted_keys_dir: PathBuf,
     #[serde(default)]
     pub repositories: Vec<RepoSource>,
+    /// Where `mitos-pkgd` (see `crate::daemon`) listens, and where
+    /// `DaemonClient::connect` looks by default. `#[serde(default = ...)]`
+    /// so a `config.json` written before the daemon existed still loads
+    /// unmodified, picking up the standard path.
+    #[serde(default = "Config::default_daemon_socket")]
+    pub daemon_socket: PathBuf,
 }
 
 impl Default for Config {
@@ -67,12 +73,22 @@ impl Default for Config {
             repositories: vec![RepoSource::Url(
                 "https://packages.mitos-os.org/index.json".to_string(),
             )],
+            daemon_socket: Config::default_daemon_socket(),
         }
     }
 }
 
 impl Config {
     pub const DEFAULT_PATH: &'static str = "/etc/mitos-pkg/config.json";
+    /// `/run` (not `/var/run`) per the FHS layout the rest of MITOS
+    /// targets — a `tmpfs`-backed runtime directory that's expected to
+    /// be recreated on every boot, which is exactly the lifetime a
+    /// socket file should have.
+    pub const DEFAULT_SOCKET: &'static str = "/run/mitos-pkg/pkgd.sock";
+
+    fn default_daemon_socket() -> PathBuf {
+        PathBuf::from(Self::DEFAULT_SOCKET)
+    }
 
     pub fn load_or_default(path: &Path) -> Result<Self> {
         if !path.exists() {
