@@ -22,9 +22,19 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! A third option alongside "shell out to the CLI" and "link the
+//! library": talk to `mitos-pkgd`, the background service in
+//! [`daemon`], over a Unix socket via [`daemon::client::DaemonClient`].
+//! This is what a GUI wants — installs/removals/upgrades happen in a
+//! privileged daemon process instead of the GUI's own (unprivileged, as
+//! it should be) process, and progress streams back live instead of the
+//! call just blocking until it's done. See [`daemon`]'s module docs and
+//! `docs/INTEGRATION.md`.
 
 pub mod cli;
 pub mod config;
+pub mod daemon;
 pub mod database;
 pub mod dependency;
 pub mod error;
