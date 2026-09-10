@@ -11,7 +11,9 @@ use crate::repository::index::RepositoryIndex;
 use crate::repository::metadata::PackageMetadata;
 use crate::security::keys::KeyStore;
 use crate::service::lock::Lock;
+use crate::service::progress::{Progress, ProgressEvent};
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// The single entry point `main` talks to. Everything below `main.rs`
@@ -29,6 +31,10 @@ pub struct PackageService {
 /// What `mitos-pkg info` shows. Populated from the local install DB when
 /// the package is installed (the actual state of the system), falling
 /// back to the repository index when it's merely available.
+///
+/// `Serialize`/`Deserialize` so `mitos-pkgd` can send this straight back
+/// to a client over the wire as-is, instead of a hand-mirrored copy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfoView {
     pub name: String,
     pub version: Version,
@@ -68,10 +74,19 @@ impl PackageService {
     /// claims to be signed but can't produce a valid signature is treated
     /// the same as a tampered one, not silently downgraded to unsigned.
     pub fn update(&mut self) -> Result<()> {
+        self.update_with_progress(&mut Progress::none())
+    }
+
+    /// Same as `update`, reporting an `Updating` event before fetching
+    /// each configured repository's index.
+    pub fn update_with_progress(&mut self, progress: &mut Progress) -> Result<()> {
         let fetcher = HttpFetcher;
         let mut merged = RepositoryIndex::default();
 
         for repo in &self.config.repositories {
+            progress.emit(ProgressEvent::Updating {
+                repository: repo.url().to_string(),
+            });
             let data = fetcher.fetch(repo.url())?;
 
             if let Some(signer) = repo.signer() {
@@ -108,14 +123,23 @@ impl PackageService {
         &self,
         fetcher: &HttpFetcher,
         meta: &PackageMetadata,
+        progress: &mut Progress,
     ) -> Result<(PathBuf, Manifest)> {
         let dest = self
             .config
             .download_cache_path(&format::package_filename(&meta.name, &meta.version));
         if !dest.exists() {
+            progress.emit(ProgressEvent::Fetching {
+                name: meta.name.clone(),
+                version: meta.version.to_string(),
+            });
             download_verified(fetcher, &meta.url, &meta.sha256, &meta.name, &dest)?;
         }
 
+        progress.emit(ProgressEvent::Verifying {
+            name: meta.name.clone(),
+            version: meta.version.to_string(),
+        });
         let manifest = archive::read_manifest(&dest)?;
         pkg_signature::verify_package(
             &dest,
@@ -137,6 +161,12 @@ impl PackageService {
     /// currently roll back an entire multi-package plan, only the single
     /// package transaction that failed (see `Transaction::install`).
     pub fn install(&mut self, spec: &str) -> Result<()> {
+        self.install_with_progress(spec, &mut Progress::none())
+    }
+
+    /// Same as `install`, reporting each resolve/fetch/verify/install step
+    /// as it happens.
+    pub fn install_with_progress(&mut self, spec: &str, progress: &mut Progress) -> Result<()> {
         let _lock = Lock::acquire(&self.config.db_dir)?;
         let (name, req) = parse_pinned(spec)?;
 
@@ -144,6 +174,9 @@ impl PackageService {
             return Err(PkgError::AlreadyInstalled(name, existing.version.to_string()));
         }
 
+        progress.emit(ProgressEvent::Resolving {
+            spec: spec.to_string(),
+        });
         let plan = {
             let resolver = Resolver::new(&self.index, &self.packages);
             resolver.resolve_install_req(&name, &req)?
@@ -151,7 +184,7 @@ impl PackageService {
 
         let fetcher = HttpFetcher;
         for meta in &plan.order {
-            self.install_one(&fetcher, meta, meta.name == name)?;
+            self.install_one(&fetcher, meta, meta.name == name, progress)?;
         }
         Ok(())
     }
@@ -161,8 +194,13 @@ impl PackageService {
         fetcher: &HttpFetcher,
         meta: &PackageMetadata,
         explicit: bool,
+        progress: &mut Progress,
     ) -> Result<()> {
-        let (dest, manifest) = self.fetch_and_verify(fetcher, meta)?;
+        let (dest, manifest) = self.fetch_and_verify(fetcher, meta, progress)?;
+        progress.emit(ProgressEvent::Installing {
+            name: meta.name.clone(),
+            version: meta.version.to_string(),
+        });
         let mut tx = Transaction::new(
             &self.config.install_root,
             &mut self.packages,
@@ -181,6 +219,17 @@ impl PackageService {
     /// or pacman's `-Rs`. Returns every package name actually removed,
     /// in the order they were removed.
     pub fn remove(&mut self, name: &str, cascade: bool) -> Result<Vec<String>> {
+        self.remove_with_progress(name, cascade, &mut Progress::none())
+    }
+
+    /// Same as `remove`, reporting a `Removing` event for each package
+    /// right before it's actually removed.
+    pub fn remove_with_progress(
+        &mut self,
+        name: &str,
+        cascade: bool,
+        progress: &mut Progress,
+    ) -> Result<Vec<String>> {
         let _lock = Lock::acquire(&self.config.db_dir)?;
 
         if !self.packages.is_installed(name) {
@@ -189,28 +238,39 @@ impl PackageService {
 
         let mut removed = Vec::new();
         if cascade {
-            self.remove_cascade(name, &mut removed)?;
+            self.remove_cascade(name, &mut removed, progress)?;
         } else {
             let dependents = Resolver::new(&self.index, &self.packages).dependents_of(name);
             if !dependents.is_empty() {
                 return Err(PkgError::RequiredByOthers(name.to_string(), dependents));
             }
+            progress.emit(ProgressEvent::Removing {
+                name: name.to_string(),
+            });
             self.remove_one(name)?;
             removed.push(name.to_string());
         }
         Ok(removed)
     }
 
-    fn remove_cascade(&mut self, name: &str, removed: &mut Vec<String>) -> Result<()> {
+    fn remove_cascade(
+        &mut self,
+        name: &str,
+        removed: &mut Vec<String>,
+        progress: &mut Progress,
+    ) -> Result<()> {
         let dependents = Resolver::new(&self.index, &self.packages).dependents_of(name);
         for dependent in dependents {
             // A shared dependent may already have been removed earlier in
             // this same cascade (e.g. two packages both pulled in the
             // same thing that itself depended on `name`).
             if self.packages.is_installed(&dependent) {
-                self.remove_cascade(&dependent, removed)?;
+                self.remove_cascade(&dependent, removed, progress)?;
             }
         }
+        progress.emit(ProgressEvent::Removing {
+            name: name.to_string(),
+        });
         self.remove_one(name)?;
         removed.push(name.to_string());
         Ok(())
@@ -265,6 +325,17 @@ impl PackageService {
         name: Option<&str>,
         ignore_hold: bool,
     ) -> Result<Vec<(String, Version, Version)>> {
+        self.upgrade_with_progress(name, ignore_hold, &mut Progress::none())
+    }
+
+    /// Same as `upgrade`, reporting each affected package's
+    /// fetch/verify/install steps as it happens.
+    pub fn upgrade_with_progress(
+        &mut self,
+        name: Option<&str>,
+        ignore_hold: bool,
+        progress: &mut Progress,
+    ) -> Result<Vec<(String, Version, Version)>> {
         let _lock = Lock::acquire(&self.config.db_dir)?;
 
         let targets: Vec<String> = match name {
@@ -299,14 +370,20 @@ impl PackageService {
             let held = installed.held;
 
             self.check_upgrade_safe(&pkg_name, &to)?;
-            self.upgrade_one(&pkg_name, explicit, held)?;
+            self.upgrade_one(&pkg_name, explicit, held, progress)?;
             upgraded.push((pkg_name, from, to));
         }
 
         Ok(upgraded)
     }
 
-    fn upgrade_one(&mut self, name: &str, explicit: bool, held: bool) -> Result<()> {
+    fn upgrade_one(
+        &mut self,
+        name: &str,
+        explicit: bool,
+        held: bool,
+        progress: &mut Progress,
+    ) -> Result<()> {
         let latest = self
             .index
             .latest(name)
@@ -317,7 +394,7 @@ impl PackageService {
         // Fetch + verify the new archive *before* touching anything
         // currently installed, so a bad download never leaves the
         // package removed with nothing valid to replace it.
-        let (dest, manifest) = self.fetch_and_verify(&fetcher, &latest)?;
+        let (dest, manifest) = self.fetch_and_verify(&fetcher, &latest, progress)?;
 
         // Pull in any dependency the new version introduces that the old
         // one didn't have.
@@ -330,7 +407,7 @@ impl PackageService {
             if !self.packages.is_installed(&dep_name) {
                 let plan = Resolver::new(&self.index, &self.packages).resolve_install(&dep_name)?;
                 for meta in &plan.order {
-                    self.install_one(&fetcher, meta, false)?;
+                    self.install_one(&fetcher, meta, false, progress)?;
                 }
             }
         }
@@ -339,6 +416,10 @@ impl PackageService {
         // one, carrying over whether it was explicitly requested and
         // whether it was held (a forced upgrade of a held package leaves
         // it held, the same way apt doesn't auto-unhold on override).
+        progress.emit(ProgressEvent::Installing {
+            name: name.to_string(),
+            version: latest.version.to_string(),
+        });
         {
             let mut tx = Transaction::new(
                 &self.config.install_root,
@@ -387,6 +468,12 @@ impl PackageService {
     /// so this keeps going until a full pass finds nothing left to
     /// remove.
     pub fn autoremove(&mut self) -> Result<Vec<String>> {
+        self.autoremove_with_progress(&mut Progress::none())
+    }
+
+    /// Same as `autoremove`, reporting a `Removing` event for each orphan
+    /// as it's found and removed.
+    pub fn autoremove_with_progress(&mut self, progress: &mut Progress) -> Result<Vec<String>> {
         let _lock = Lock::acquire(&self.config.db_dir)?;
 
         let mut removed = Vec::new();
@@ -402,6 +489,7 @@ impl PackageService {
 
             let Some(name) = orphan else { break };
 
+            progress.emit(ProgressEvent::Removing { name: name.clone() });
             self.remove_one(&name)?;
             removed.push(name);
         }
