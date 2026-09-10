@@ -29,12 +29,55 @@ instead of `/`. `--config <path>` overrides the config file location. See
 [`docs/INTEGRATION.md`](docs/INTEGRATION.md) for the full CLI/library
 reference other MITOS components can build against.
 
+## mitos-pkgd (daemon)
+
+The CLI above talks to the package database directly — fine for a
+terminal, but it means every install needs both a terminal *and* root.
+`mitos-pkgd` is a second binary built from this same crate: a background
+service, normally started once at boot by `mitos-services`, that any
+number of unprivileged clients (a GUI software panel, `mitos-settings`,
+scripts) can connect to over a local Unix socket instead — the daemon
+does the actual privileged filesystem writes, the client just asks.
+
+```
+mitos-pkgd [--config <path>] [--socket <path>]
+```
+
+Rust components link `mitos_pkg::daemon::client::DaemonClient` rather
+than hand-rolling the socket protocol:
+
+```rust,no_run
+use mitos_pkg::daemon::client::DaemonClient;
+use std::path::Path;
+
+# fn main() -> std::io::Result<()> {
+let mut client = DaemonClient::connect(Path::new("/run/mitos-pkg/pkgd.sock"))?;
+client.install("mitos-shell", |event| println!("{event:?}"))
+    .expect("install failed");
+# Ok(())
+# }
+```
+
+`install`/`remove`/`upgrade`/`update`/`autoremove` take a progress
+callback (`ProgressEvent`: resolving/fetching/verifying/installing/
+removing/updating) streamed live from the daemon — this is what lets a
+GUI show real progress instead of a spinner over a blocked call. See
+[`docs/INTEGRATION.md`](docs/INTEGRATION.md#mitos-pkgd-daemon) for the
+wire protocol, if you're connecting from something that isn't Rust.
+
 ## Layout
 
 ```
 src/
 main.rs thin CLI dispatch → service::PackageService
 cli.rs clap argument/subcommand definitions
+bin/mitos-pkgd.rs thin daemon entry point → daemon::server::run
+
+daemon/ mitos-pkgd: a non-CLI way to drive mitos-pkg
+protocol.rs NDJSON wire format (Request/Message/ResponsePayload)
+server.rs Unix-socket listener, thread-per-connection,
+RwLock<PackageService> dispatch
+client.rs DaemonClient — the Rust side for mitos-gui etc.
 
 package/ what a .mpkg archive *is*, and how to make one
 manifest.rs Manifest struct embedded in every archive
@@ -76,8 +119,10 @@ keys.rs trusted signer keystore
 
 config/ on-disk config → resolved paths; RepoSource
 (plain URL, or {url, signer} for a signed repo)
-service/ orchestration layer main.rs calls into
+service/ orchestration layer main.rs (and mitos-pkgd) call into
 lock.rs exclusive lock over the package database
+progress.rs ProgressEvent + the *_with_progress method
+variants; what mitos-pkgd streams to clients
 error.rs one PkgError enum for the whole crate
 
 docs/
@@ -139,6 +184,23 @@ each other's writes.
 - **Chroot-friendly by construction.** Every filesystem path flows through
 `config::Config`, so the whole tool can run against a non-`/` root for
 testing or image builds via `mitos-pkg --root <path> ...`.
+- **`mitos-pkgd` is thread-per-connection, not async.** Connections are
+rare (a handful of GUI panels, an occasional CLI call) and every
+mutating request already serializes through one `RwLock` write lock, so
+an async I/O driver would cost resident memory the same way `tokio`
+would for the CLI's networking — see the `ureq` note in `Cargo.toml`.
+Read-only requests (`list`/`search`/`info`/`clean`) take a read lock
+instead, so a GUI can keep refreshing its panel while something else
+installs.
+- **The daemon's socket is the access-control boundary, not a
+per-action policy engine.** `mitos-pkgd`'s socket is created `0660` —
+root and one group can connect, everyone else is refused before a byte
+of protocol is parsed. *Which* users are in that group is left to
+whatever starts the daemon (`mitos-services` already owns runtime-
+directory ownership and privilege dropping elsewhere in MITOS); there's
+no PackageKit-style polkit layer distinguishing "may list" from "may
+install" within a connection that's already allowed to connect at all.
+That's a deliberate scope line for now, not an oversight — see Status.
 
 ## Building a package
 
@@ -186,3 +248,18 @@ attack-surface tradeoff as much as a scope one.
 When more than one repository lists the same package name, the highest
 version wins regardless of which repo it came from — there's no
 apt-pinning or dnf-priority equivalent yet.
+- **`mitos-pkgd` has no per-action authorization.** Anyone who can open
+the socket can do anything a `PackageService` can do — there's no
+polkit-style "may search, may not install" distinction between clients.
+Coarser than that: connection-level (socket permissions), not
+request-level.
+- **Progress reporting is per-package-phase, not per-byte.** A GUI
+watching `ProgressEvent::Fetching` sees "downloading mitos-shell" but
+not a percentage — byte-level progress would mean threading a callback
+into `repository::download`'s HTTP loop, not done here yet.
+- **No graceful `mitos-pkgd` shutdown handling.** The daemon doesn't
+catch `SIGTERM` to unbind its socket cleanly; it relies on the next
+startup's stale-socket check (connect-then-remove) instead of an
+explicit shutdown path. Fine for a service manager that just kills the
+process, less fine if `mitos-services` ever wants a clean-drain
+shutdown protocol.
