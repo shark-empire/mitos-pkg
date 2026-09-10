@@ -6,11 +6,11 @@ reads and writes. If you're building `mitos-installer`, `mitos-gui`,
 `mitos-settings`, `mitos-update`, `mitos-recovery`, `mitos-build`, or
 `mitos-repo`, this is the doc to check first.
 
-`mitos-pkg` is at version `0.3.0` — nothing here is under a stability
+`mitos-pkg` is at version `0.4.0` — nothing here is under a stability
 guarantee yet. Treat file/CLI formats as likely-stable and the exact Rust
 API (function signatures, struct fields) as more likely to shift.
 
-## Two ways to connect
+## Three ways to connect
 
 **Shell out to the `mitos-pkg` binary** if your component isn't Rust, or
 runs in its own process anyway (a shell script, `mitos-installer`'s
@@ -23,13 +23,20 @@ report in `mitos-installer`), either parse conservatively (formats are
 documented below and used in tests) or use the library instead — parsing
 stdout is inherently the more fragile of the two options.
 
-**Link `mitos-pkg` as a library** if your component is Rust. As of this
-change the crate builds both a library (`mitos_pkg`) and the `mitos-pkg`
-binary from the same source — the binary is a thin wrapper over
-`mitos_pkg::service::PackageService`, the same type you'd call directly.
-This is the more robust option: typed errors (`PkgError`), typed results
+**Link `mitos-pkg` as a library** if your component is Rust and either
+already runs privileged, or is fine calling `PackageService` in its own
+process (a first-boot installer, a build/CI tool). This is the most
+direct option: typed errors (`PkgError`), typed results
 (`Vec<(String, Version, Version)>` from `upgrade`, not a string to parse),
 no subprocess overhead. See [Library API](#library-api) below.
+
+**Connect to `mitos-pkgd`** — the daemon — if your component is a GUI, or
+anything else that runs as the logged-in user and shouldn't itself run
+privileged just to install a package. `mitos-pkgd` is a background
+service (its own binary, same crate) that holds one `PackageService` and
+serves it to unprivileged local clients over a Unix socket, streaming
+typed progress events back as an operation runs. See
+[mitos-pkgd (daemon)](#mitos-pkgd-daemon) below.
 
 In your `Cargo.toml`:
 
@@ -114,15 +121,115 @@ every package actually removed.
 - `search(query: &str) -> Vec<&PackageMetadata>` — `&self`.
 - `info(name: &str) -> Result<InfoView>` — `&self`.
 
+`install`, `remove`, `upgrade`, `update`, and `autoremove` each have an
+`*_with_progress` twin (`install_with_progress`, etc.) taking one extra
+`&mut service::Progress` argument, built from `Progress::new(&mut |event|
+{ ... })` — same behavior, plus a `ProgressEvent` (resolving/fetching/
+verifying/installing/removing/updating) reported at each step. The plain
+methods are exactly `*_with_progress` called with `Progress::none()` — use
+them directly if you don't need progress; this is what `mitos-pkgd` uses
+to stream events to daemon clients (see below).
+
 `Result<T>` is `Result<T, PkgError>`; match on `PkgError`'s variants
 (`error.rs`) instead of formatting-and-parsing the CLI's error text.
 
 `Config` fields you're likely to set directly rather than load from disk
 (e.g. `mitos-installer` pointing at a mounted target): `install_root`,
-`db_dir`, `cache_dir`, `trusted_keys_dir`, `repositories: Vec<RepoSource>`.
+`db_dir`, `cache_dir`, `trusted_keys_dir`, `repositories: Vec<RepoSource>`,
+`daemon_socket` (only relevant if you're also running/connecting to
+`mitos-pkgd` against this same config).
 `RepoSource::Url(String)` for a plain repo, or
 `RepoSource::Detailed { url, signer: Option<String> }` for one whose index
 must be signed (see [Repository index](#repository-index-indexjson)).
+
+## mitos-pkgd (daemon)
+
+Everything above runs `PackageService` in your own process. `mitos-pkgd`
+instead runs it once, in a long-lived (typically root) process, and
+serves it to any number of unprivileged clients over a Unix socket at
+`Config::daemon_socket` (default `/run/mitos-pkg/pkgd.sock`) — this is
+what `mitos-gui` / `mitos-settings` should use for anything user-facing:
+no polkit prompt or running the whole GUI as root just to install a
+package, and progress streams back live instead of the call blocking
+silently.
+
+**Rust clients**: use `mitos_pkg::daemon::client::DaemonClient` rather
+than speaking the wire protocol directly.
+
+```rust,no_run
+use mitos_pkg::daemon::client::DaemonClient;
+use std::path::Path;
+
+# fn main() -> std::io::Result<()> {
+let mut client = DaemonClient::connect(Path::new("/run/mitos-pkg/pkgd.sock"))?;
+
+client.install("mitos-shell", |event| {
+    println!("{event:?}"); // ProgressEvent, streamed live
+})?; // ClientResult<()> — ClientError::{Io, Daemon(String), UnexpectedResponse}
+
+let installed = client.list()?; // Vec<(String, InstalledPackage)>
+# Ok(())
+# }
+```
+
+`DaemonClient` methods mirror `PackageService`'s: `install`, `remove`,
+`upgrade`, `autoremove`, `update` each take a progress closure the same
+shape as `Progress::new`'s; `hold`, `unhold`, `list`, `search`, `info`,
+`clean` don't stream progress (nothing to report — they're either
+instant or a single filesystem sweep); `ping()` is a liveness check for
+detecting "daemon not running" up front. Errors from the daemon arrive
+as `ClientError::Daemon(String)` — the same text `PkgError::to_string()`
+produces, **not** a typed `PkgError` (see below for why).
+
+**Non-Rust clients**: connect to the socket and speak newline-delimited
+JSON (NDJSON) directly — one `Request` object per line, replied to with
+zero or more `{"type":"progress", "phase": ..., ...}` lines followed by
+exactly one terminal `{"type":"ok", "kind": ..., ...}` or
+`{"type":"err","message":"..."}` line. A connection may be reused for
+further requests.
+
+```json
+{"op":"install","spec":"mitos-shell"}
+```
+```json
+{"type":"progress","phase":"resolving","spec":"mitos-shell"}
+{"type":"progress","phase":"fetching","name":"mitos-shell","version":"1.2.0"}
+{"type":"progress","phase":"verifying","name":"mitos-shell","version":"1.2.0"}
+{"type":"progress","phase":"installing","name":"mitos-shell","version":"1.2.0"}
+{"type":"ok","kind":"unit"}
+```
+
+Every `Request` variant (`src/daemon/protocol.rs`), tagged by `"op"`:
+`ping`, `install {spec}`, `remove {name, cascade}`,
+`upgrade {name, ignore_hold}` (`name` nullable), `hold {name}`,
+`unhold {name}`, `autoremove`, `list`, `search {query}`, `info {name}`,
+`update`, `clean` — the same operations as the CLI/library, minus
+`build` (a pure local transform with nothing for a persistent daemon to
+add). `ResponsePayload` (tagged by `"kind"`): `pong`, `unit`,
+`removed {names}`, `upgraded {changes}` (`[name, old, new]` triples),
+`listed {packages}` (`[name, InstalledPackage]` pairs),
+`searched {matches}` (`PackageMetadata[]`), `info {...}` (an `InfoView`,
+fields merged in directly), `freed {bytes}`.
+
+Errors cross the wire as `{"type":"err","message":"..."}` — formatted
+text, not a serialized `PkgError` — deliberately: `PkgError`'s variant
+set can keep growing without that being a protocol-breaking wire change.
+If you need to branch on *which* error happened rather than just
+surface it, link the library and call `PackageService` directly instead
+of going through the daemon.
+
+**Access control** is at the socket level, not per-request: the socket
+is created `0660`, so only root (who owns it) and members of whatever
+group owns it can connect at all — there's no distinction, once
+connected, between "may list" and "may install". Which users are in
+that group is a deployment decision (set by whatever starts
+`mitos-pkgd`, typically a `mitos-services` unit — see that project for
+runtime-directory ownership), not something `mitos-pkgd` decides for
+itself.
+
+**Running it**: `mitos-pkgd [--config <path>] [--socket <path>]`, same
+flag shape as the CLI. Meant to be started once at boot (by
+`mitos-services`) and left running, not invoked per-command.
 
 ## On-disk layout
 
@@ -263,11 +370,16 @@ layout" above — they don't follow `--root` automatically). Link the
 library rather than shelling out if you want typed progress/error
 reporting during a first-boot install sequence.
 - **`mitos-gui` / `mitos-settings`** (a software-center-style panel):
-either read `packages.json` directly for a fast listing, or call
-`PackageService::list`/`search`/`info` for the same data with less
-risk of the on-disk format shifting under you. Installs/removes/
-upgrades should go through the library (typed errors) or the CLI with
-care taken around its plain-text output — not direct file writes.
+connect to `mitos-pkgd` (see [mitos-pkgd (daemon)](#mitos-pkgd-daemon))
+rather than linking the library directly — a GUI runs as the logged-in
+user, and installs/removes/upgrades need privileges that process
+shouldn't have to carry itself. `DaemonClient::list`/`search`/`info`
+cover a fast panel refresh with no privilege concern either way
+(read-only, and cheap enough to poll); reading `packages.json` directly
+is still an option if you don't want even a socket round trip for that
+part specifically, but installs/removes/upgrades should go through the
+daemon so progress streams back live and the write happens in the
+already-privileged process instead of yours.
 - **`mitos-update`**: `service.update()` then `service.upgrade(None, false)`
 on whatever schedule/trigger you use; check `upgrade`'s returned
 `Vec` to know what changed instead of parsing CLI stdout.
