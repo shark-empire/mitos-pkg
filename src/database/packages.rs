@@ -1,5 +1,7 @@
 use crate::dependency::version::Dependency;
 use crate::error::Result;
+use crate::package::arch::default_arch;
+use crate::package::hooks::Hooks;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -33,6 +35,31 @@ pub struct InstalledPackage {
     /// with every pre-existing package treated as unheld.
     #[serde(default)]
     pub held: bool,
+    /// See `package::arch`. `#[serde(default)]` so a database written
+    /// before this field existed loads cleanly, treating every
+    /// pre-existing installed package as arch-independent (the closest
+    /// approximation of "unknown" that doesn't spuriously block anything
+    /// already on the system).
+    #[serde(default = "default_arch")]
+    pub arch: Vec<String>,
+    /// See `Manifest::essential`. `#[serde(default)]` = not essential,
+    /// for the same backward-compatibility reason as `arch`.
+    #[serde(default)]
+    pub essential: bool,
+    /// Snapshot of `Manifest::hooks` at install time, so `remove` can run
+    /// `pre_remove`/`post_remove` without needing the original archive
+    /// still cached. `#[serde(default)]` = no hooks, for packages
+    /// installed before this field existed.
+    #[serde(default)]
+    pub hooks: Hooks,
+    /// Snapshot of `Manifest::payload_sha256` at install time — what
+    /// `PackageService::verify` re-derives the on-disk files' aggregate
+    /// hash against to detect drift/corruption/tampering after install.
+    /// `#[serde(default)]` (empty string) for packages installed before
+    /// this field existed; `verify` treats an empty expected hash as
+    /// "nothing recorded to check against" rather than a mismatch.
+    #[serde(default)]
+    pub payload_sha256: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
