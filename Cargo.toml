@@ -22,6 +22,15 @@ semver = { version = "1", features = ["serde"] }
 # memory even for a tool that only ever does one download at a time.
 ureq = "3"
 
+# Free-disk-space check before an install writes anything (`install::diskspace`).
+# There's no stable std API for this, and the raw statvfs(2) struct layout
+# is ABI-specific enough (field widths/padding differ by libc version)
+# that hand-rolling the FFI risks a silent, hard-to-catch mismatch. `libc`
+# is close to the minimum possible cost for this — extern declarations
+# only, no allocation, no runtime — in keeping with the same
+# memory-conscious reasoning as the `ureq` choice above.
+libc = "0.2"
+
 [profile.release]
 # Optimize the shipped binary for size and lean runtime footprint rather
 # than raw speed — mitos-pkg spends almost all its time on I/O (network,
