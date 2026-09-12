@@ -18,13 +18,24 @@
 //! needs to branch on *which* error happened, not just report it, should
 //! link `mitos-pkg` as a library and call `PackageService` directly
 //! instead of going through the daemon — see `docs/INTEGRATION.md`.
+//!
+//! Every mutating request (`Install`, `InstallLocal`, `Remove`, `Upgrade`)
+//! carries its own `dry_run` field, `#[serde(default)]` so an older client
+//! that doesn't know about it gets real execution — the same default
+//! `PackageService`'s own plain (non-`_with_progress`) methods use.
 
+use crate::database::history::HistoryEntry;
 use crate::database::packages::InstalledPackage;
 use crate::repository::metadata::PackageMetadata;
-use crate::service::{InfoView, ProgressEvent};
+use crate::service::{InfoView, ProgressEvent, VerifyIssue};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
+
+fn default_history_limit() -> usize {
+    20
+}
 
 /// Every operation a client can ask `mitos-pkgd` to perform. Mirrors
 /// `service::PackageService`'s public surface (see `docs/INTEGRATION.md`
@@ -39,18 +50,62 @@ pub enum Request {
     /// "daemon not running" and fall back to linking the library or
     /// shelling out to the CLI instead.
     Ping,
-    Install { spec: String },
-    Remove { name: String, cascade: bool },
+    Install {
+        spec: String,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// Installs an already-built `.mpkg` file the daemon can read at
+    /// `path` on its own filesystem — meaningful because client and
+    /// daemon are both local to the same machine (this is a Unix socket),
+    /// so a path the client can see is normally one `mitos-pkgd` can see
+    /// too. `signature` is the same hex string `mitos-pkg install
+    /// --signature` takes on the CLI.
+    InstallLocal {
+        path: PathBuf,
+        #[serde(default)]
+        signature: Option<String>,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    Remove {
+        name: String,
+        cascade: bool,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        dry_run: bool,
+    },
     Upgrade {
         name: Option<String>,
         ignore_hold: bool,
+        #[serde(default)]
+        dry_run: bool,
     },
-    Hold { name: String },
-    Unhold { name: String },
+    Hold {
+        name: String,
+    },
+    Unhold {
+        name: String,
+    },
     Autoremove,
     List,
-    Search { query: String },
-    Info { name: String },
+    Search {
+        query: String,
+    },
+    Info {
+        name: String,
+    },
+    /// Re-checks installed files against what was recorded at install
+    /// time. `name: None` checks every installed package.
+    Verify {
+        name: Option<String>,
+    },
+    /// The most recent completed operations, oldest first.
+    History {
+        #[serde(default = "default_history_limit")]
+        limit: usize,
+    },
     Update,
     Clean,
 }
@@ -74,15 +129,25 @@ pub enum Message {
 pub enum ResponsePayload {
     /// `Ping`'s reply.
     Pong,
-    /// `Install`, `Upgrade` (as a no-name-given no-op), `Hold`, `Unhold`,
-    /// `Update` — anything whose `PackageService` method returns `()`.
+    /// `Hold`, `Unhold`, `Update` — anything whose `PackageService` method
+    /// returns `()`.
     Unit,
-    /// `Remove`, `Autoremove` — every package name actually removed.
-    Removed { names: Vec<String> },
+    /// `Install`, `InstallLocal` — every package installed (or, if
+    /// `dry_run` was set, every package that *would* be installed), in
+    /// resolution order.
+    Installed {
+        packages: Vec<(String, Version)>,
+        dry_run: bool,
+    },
+    /// `Remove`, `Autoremove` — every package name actually removed (or
+    /// planned, under `dry_run`; `Autoremove` never sets it, since it has
+    /// no dry-run mode of its own).
+    Removed { names: Vec<String>, dry_run: bool },
     /// `Upgrade` — `(name, old_version, new_version)` per package
-    /// actually upgraded.
+    /// actually upgraded (or planned, under `dry_run`).
     Upgraded {
         changes: Vec<(String, Version, Version)>,
+        dry_run: bool,
     },
     /// `List` — every installed package, name alongside its full record.
     Listed {
@@ -92,6 +157,10 @@ pub enum ResponsePayload {
     Searched { matches: Vec<PackageMetadata> },
     /// `Info`.
     Info(InfoView),
+    /// `Verify`.
+    Verified { issues: Vec<VerifyIssue> },
+    /// `History`.
+    History { entries: Vec<HistoryEntry> },
     /// `Clean` — bytes freed.
     Freed { bytes: u64 },
 }

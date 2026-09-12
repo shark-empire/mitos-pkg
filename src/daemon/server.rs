@@ -22,8 +22,10 @@ use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::Duration;
 
 /// Binds `socket_path`, clearing away a stale socket left behind by a
 /// previous unclean shutdown (nothing answers on it anymore) but
@@ -63,8 +65,62 @@ fn bind_socket(socket_path: &Path) -> std::io::Result<UnixListener> {
     // whatever starts it (mitos-services already owns runtime-directory
     // ownership and privilege dropping for the rest of MITOS; duplicating
     // that here would just give this daemon its own, different answer).
+    //
+    // This is connection-level access control, not per-request
+    // authorization: anyone who can open the socket at all can issue any
+    // request a `PackageService` supports, install included. There is no
+    // polkit-style "may search, may not install" distinction between two
+    // clients that both got this far — see README "Status".
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))?;
     Ok(listener)
+}
+
+/// Set from `request_shutdown` (a signal handler — see
+/// `install_shutdown_handlers`) and polled by `watch_for_shutdown`. A
+/// plain `AtomicBool` rather than anything requiring allocation or a
+/// syscall wrapper, since a signal handler can only safely touch a small,
+/// well-defined set of async-signal-safe operations — a lock-free store
+/// to a static is one of them; logging, removing a file, or exiting the
+/// process are not, which is why none of those happen inside the handler
+/// itself.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_shutdown(_signum: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Installs handlers for `SIGTERM`/`SIGINT` that only set a flag (see
+/// `SHUTDOWN_REQUESTED`) — the actual shutdown work happens on an
+/// ordinary thread that polls it (`watch_for_shutdown`), never inside the
+/// signal handler itself.
+fn install_shutdown_handlers() {
+    unsafe {
+        libc::signal(libc::SIGTERM, request_shutdown as libc::sighandler_t);
+        libc::signal(libc::SIGINT, request_shutdown as libc::sighandler_t);
+    }
+}
+
+/// Polls `SHUTDOWN_REQUESTED` and, once set, removes `socket_path` and
+/// exits — letting the *next* `mitos-pkgd` start cleanly without going
+/// through `bind_socket`'s stale-socket detection dance, and giving
+/// whatever's supervising this process (`mitos-services`, or a plain
+/// `systemd` unit) a prompt, deliberate exit instead of relying on
+/// `SIGTERM`'s default disposition.
+///
+/// This is *not* a full graceful-drain shutdown: in-flight requests on
+/// already-accepted connections are simply cut short by the process
+/// exiting, not allowed to finish first. Doing that properly needs a
+/// connection-tracking + drain protocol this crate doesn't have yet —
+/// see README "Status".
+fn watch_for_shutdown(socket_path: PathBuf) {
+    loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            eprintln!("mitos-pkgd: received shutdown signal, removing socket and exiting");
+            let _ = fs::remove_file(&socket_path);
+            std::process::exit(0);
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Runs the daemon until the process is killed: binds `socket_path` and
@@ -74,6 +130,12 @@ fn bind_socket(socket_path: &Path) -> std::io::Result<UnixListener> {
 pub fn run(service: PackageService, socket_path: PathBuf) -> std::io::Result<()> {
     let listener = bind_socket(&socket_path)?;
     let service = Arc::new(RwLock::new(service));
+
+    install_shutdown_handlers();
+    thread::spawn({
+        let socket_path = socket_path.clone();
+        move || watch_for_shutdown(socket_path)
+    });
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -124,16 +186,12 @@ fn handle_connection(stream: UnixStream, service: Arc<RwLock<PackageService>>) {
 }
 
 /// Runs one request to completion and writes its terminal message.
-/// Read-only requests (`List`, `Search`, `Info`, `Clean`) take a read
-/// lock, so several can proceed at once even while nothing is
-/// installing; every mutating request takes the write lock for the
-/// whole operation, streaming `Message::Progress` events to this
+/// Read-only requests (`List`, `Search`, `Info`, `Verify`, `History`,
+/// `Clean`) take a read lock, so several can proceed at once even while
+/// nothing is installing; every mutating request takes the write lock
+/// for the whole operation, streaming `Message::Progress` events to this
 /// connection as `PackageService` reports them.
-fn dispatch(
-    request: Request,
-    service: &Arc<RwLock<PackageService>>,
-    writer: &mut impl Write,
-) {
+fn dispatch(request: Request, service: &Arc<RwLock<PackageService>>, writer: &mut impl Write) {
     // Scoped so the closure's mutable borrow of `writer` provably ends
     // before `writer` is used again below for the terminal message —
     // `outcome` owns no reference back into `writer` once this block
@@ -146,23 +204,42 @@ fn dispatch(
         match request {
             Request::Ping => Ok(ResponsePayload::Pong),
 
-            Request::Install { spec } => {
+            Request::Install { spec, dry_run } => {
                 let mut svc = service.write().expect("package service lock poisoned");
                 let mut progress = Progress::new(&mut emit_progress);
-                svc.install_with_progress(&spec, &mut progress)
-                    .map(|()| ResponsePayload::Unit)
+                svc.install_with_progress(&spec, None, dry_run, &mut progress)
+                    .map(|packages| ResponsePayload::Installed { packages, dry_run })
             }
-            Request::Remove { name, cascade } => {
+            Request::InstallLocal {
+                path,
+                signature,
+                dry_run,
+            } => {
                 let mut svc = service.write().expect("package service lock poisoned");
                 let mut progress = Progress::new(&mut emit_progress);
-                svc.remove_with_progress(&name, cascade, &mut progress)
-                    .map(|names| ResponsePayload::Removed { names })
+                svc.install_local_with_progress(&path, signature.as_deref(), dry_run, &mut progress)
+                    .map(|packages| ResponsePayload::Installed { packages, dry_run })
             }
-            Request::Upgrade { name, ignore_hold } => {
+            Request::Remove {
+                name,
+                cascade,
+                force,
+                dry_run,
+            } => {
                 let mut svc = service.write().expect("package service lock poisoned");
                 let mut progress = Progress::new(&mut emit_progress);
-                svc.upgrade_with_progress(name.as_deref(), ignore_hold, &mut progress)
-                    .map(|changes| ResponsePayload::Upgraded { changes })
+                svc.remove_with_progress(&name, cascade, force, dry_run, &mut progress)
+                    .map(|names| ResponsePayload::Removed { names, dry_run })
+            }
+            Request::Upgrade {
+                name,
+                ignore_hold,
+                dry_run,
+            } => {
+                let mut svc = service.write().expect("package service lock poisoned");
+                let mut progress = Progress::new(&mut emit_progress);
+                svc.upgrade_with_progress(name.as_deref(), ignore_hold, dry_run, &mut progress)
+                    .map(|changes| ResponsePayload::Upgraded { changes, dry_run })
             }
             Request::Hold { name } => {
                 let mut svc = service.write().expect("package service lock poisoned");
@@ -176,7 +253,7 @@ fn dispatch(
                 let mut svc = service.write().expect("package service lock poisoned");
                 let mut progress = Progress::new(&mut emit_progress);
                 svc.autoremove_with_progress(&mut progress)
-                    .map(|names| ResponsePayload::Removed { names })
+                    .map(|names| ResponsePayload::Removed { names, dry_run: false })
             }
             Request::Update => {
                 let mut svc = service.write().expect("package service lock poisoned");
@@ -205,6 +282,16 @@ fn dispatch(
             Request::Info { name } => {
                 let svc = service.read().expect("package service lock poisoned");
                 svc.info(&name).map(ResponsePayload::Info)
+            }
+            Request::Verify { name } => {
+                let svc = service.read().expect("package service lock poisoned");
+                svc.verify(name.as_deref())
+                    .map(|issues| ResponsePayload::Verified { issues })
+            }
+            Request::History { limit } => {
+                let svc = service.read().expect("package service lock poisoned");
+                svc.history(limit)
+                    .map(|entries| ResponsePayload::History { entries })
             }
         }
     };

@@ -20,9 +20,10 @@
 //! ```
 
 use crate::daemon::protocol::{read_json_line, write_json_line, Message, Request, ResponsePayload};
+use crate::database::history::HistoryEntry;
 use crate::database::packages::InstalledPackage;
 use crate::repository::metadata::PackageMetadata;
-use crate::service::{InfoView, ProgressEvent};
+use crate::service::{InfoView, ProgressEvent, VerifyIssue};
 use semver::Version;
 use std::io::{self, BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
@@ -112,7 +113,9 @@ impl DaemonClient {
     }
 
     /// Convenience wrapper for requests that never stream progress
-    /// (`hold`/`unhold`/`list`/`search`/`info`/`clean`/`ping`).
+    /// (`hold`/`unhold`/`list`/`search`/`info`/`verify`/`history`/`clean`/
+    /// `ping`, and any dry-run call — a dry run never touches the
+    /// filesystem, so there's nothing for a progress phase to report).
     fn call_quiet(&mut self, request: Request) -> ClientResult<ResponsePayload> {
         self.call(request, |_| {})
     }
@@ -131,14 +134,50 @@ impl DaemonClient {
         &mut self,
         spec: &str,
         on_progress: impl FnMut(ProgressEvent),
-    ) -> ClientResult<()> {
+    ) -> ClientResult<Vec<(String, Version)>> {
         match self.call(
             Request::Install {
                 spec: spec.to_string(),
+                dry_run: false,
             },
             on_progress,
         )? {
-            ResponsePayload::Unit => Ok(()),
+            ResponsePayload::Installed { packages, .. } => Ok(packages),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resolves `spec` and reports what `install` would do, without
+    /// installing anything.
+    pub fn install_dry_run(&mut self, spec: &str) -> ClientResult<Vec<(String, Version)>> {
+        match self.call_quiet(Request::Install {
+            spec: spec.to_string(),
+            dry_run: true,
+        })? {
+            ResponsePayload::Installed { packages, .. } => Ok(packages),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Installs an already-built `.mpkg` the daemon can read at `path` on
+    /// its own filesystem (see `daemon::protocol::Request::InstallLocal`).
+    /// `signature` is the same hex string `mitos-pkg install --signature`
+    /// takes on the CLI, needed only if the package declares a `signer`.
+    pub fn install_local(
+        &mut self,
+        path: &Path,
+        signature: Option<&str>,
+        on_progress: impl FnMut(ProgressEvent),
+    ) -> ClientResult<Vec<(String, Version)>> {
+        match self.call(
+            Request::InstallLocal {
+                path: path.to_path_buf(),
+                signature: signature.map(str::to_string),
+                dry_run: false,
+            },
+            on_progress,
+        )? {
+            ResponsePayload::Installed { packages, .. } => Ok(packages),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -147,16 +186,34 @@ impl DaemonClient {
         &mut self,
         name: &str,
         cascade: bool,
+        force: bool,
         on_progress: impl FnMut(ProgressEvent),
     ) -> ClientResult<Vec<String>> {
         match self.call(
             Request::Remove {
                 name: name.to_string(),
                 cascade,
+                force,
+                dry_run: false,
             },
             on_progress,
         )? {
-            ResponsePayload::Removed { names } => Ok(names),
+            ResponsePayload::Removed { names, .. } => Ok(names),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Reports what `remove` would do — including refusing the same way a
+    /// real call would (dependents in the way, or an essential package
+    /// without `force`) — without removing anything.
+    pub fn remove_dry_run(&mut self, name: &str, cascade: bool, force: bool) -> ClientResult<Vec<String>> {
+        match self.call_quiet(Request::Remove {
+            name: name.to_string(),
+            cascade,
+            force,
+            dry_run: true,
+        })? {
+            ResponsePayload::Removed { names, .. } => Ok(names),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -171,10 +228,27 @@ impl DaemonClient {
             Request::Upgrade {
                 name: name.map(str::to_string),
                 ignore_hold,
+                dry_run: false,
             },
             on_progress,
         )? {
-            ResponsePayload::Upgraded { changes } => Ok(changes),
+            ResponsePayload::Upgraded { changes, .. } => Ok(changes),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Reports what `upgrade` would do without upgrading anything.
+    pub fn upgrade_dry_run(
+        &mut self,
+        name: Option<&str>,
+        ignore_hold: bool,
+    ) -> ClientResult<Vec<(String, Version, Version)>> {
+        match self.call_quiet(Request::Upgrade {
+            name: name.map(str::to_string),
+            ignore_hold,
+            dry_run: true,
+        })? {
+            ResponsePayload::Upgraded { changes, .. } => Ok(changes),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -202,7 +276,7 @@ impl DaemonClient {
         on_progress: impl FnMut(ProgressEvent),
     ) -> ClientResult<Vec<String>> {
         match self.call(Request::Autoremove, on_progress)? {
-            ResponsePayload::Removed { names } => Ok(names),
+            ResponsePayload::Removed { names, .. } => Ok(names),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -246,6 +320,25 @@ impl DaemonClient {
             name: name.to_string(),
         })? {
             ResponsePayload::Info(info) => Ok(info),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Re-checks installed files against what was recorded at install
+    /// time. `name: None` checks every installed package.
+    pub fn verify(&mut self, name: Option<&str>) -> ClientResult<Vec<VerifyIssue>> {
+        match self.call_quiet(Request::Verify {
+            name: name.map(str::to_string),
+        })? {
+            ResponsePayload::Verified { issues } => Ok(issues),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// The most recent `limit` completed operations, oldest first.
+    pub fn history(&mut self, limit: usize) -> ClientResult<Vec<HistoryEntry>> {
+        match self.call_quiet(Request::History { limit })? {
+            ResponsePayload::History { entries } => Ok(entries),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
