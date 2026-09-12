@@ -47,7 +47,14 @@ pub fn build_package(
         )));
     }
 
+    if spec.arch.is_empty() {
+        return Err(PkgError::InvalidManifest(
+            "pkg.json's \"arch\" list is empty — use [\"any\"] for an arch-independent package, or name the architecture(s) it's built for".to_string(),
+        ));
+    }
+
     let payload_sha256 = checksum::hash_payload_dir(&payload_dir)?;
+    let installed_size_bytes = checksum::total_size(&payload_dir)?;
     let files = checksum::list_files(&payload_dir)?
         .into_iter()
         .map(|p| p.to_string_lossy().into_owned())
@@ -63,6 +70,10 @@ pub fn build_package(
         files,
         payload_sha256: payload_sha256.clone(),
         signer: spec.signer.clone(),
+        arch: spec.arch.clone(),
+        essential: spec.essential,
+        hooks: spec.hooks.clone(),
+        installed_size_bytes,
     };
 
     let signature_hex = match sign_seed {
