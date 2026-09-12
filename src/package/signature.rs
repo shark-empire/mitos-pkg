@@ -76,7 +76,10 @@ pub fn verify_index(
     sig::verify_signature(public_key, digest.as_bytes(), &sig_bytes, signer)
 }
 
-fn decode_signature(hex_str: &str, signer: &str) -> Result<[u8; 64]> {
+/// `pub` (rather than module-private) so `service::lifecycle` can decode a
+/// `--signature` value passed on the command line for a local `.mpkg`
+/// install the same way an index-published one is decoded here.
+pub fn decode_signature(hex_str: &str, signer: &str) -> Result<[u8; 64]> {
     let bytes = hex::decode(hex_str).map_err(|_| PkgError::InvalidSignature(signer.to_string()))?;
     bytes
         .try_into()

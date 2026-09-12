@@ -1,4 +1,6 @@
 use crate::dependency::version::Dependency;
+use crate::package::arch::default_arch;
+use crate::package::hooks::Hooks;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
@@ -41,4 +43,29 @@ pub struct Manifest {
     /// `package::signature::verify_package`).
     #[serde(default)]
     pub signer: Option<String>,
+    /// Architectures this package installs on (`"x86_64"`, `"aarch64"`, or
+    /// `"any"`). Defaults to `["any"]` so archives built before this field
+    /// existed keep installing exactly as before. See `package::arch`.
+    #[serde(default = "default_arch")]
+    pub arch: Vec<String>,
+    /// Core-system package: `remove`/`autoremove` refuse to touch it
+    /// without an explicit override (`PkgError::EssentialPackage`) —
+    /// mirrors dpkg's `Essential: yes` and pacman's `base`/`base-devel`
+    /// group protection. Defaults to `false`.
+    #[serde(default)]
+    pub essential: bool,
+    /// Payload-relative paths to executable scripts run at defined points
+    /// in install/remove, if present. See `install::hooks`.
+    #[serde(default)]
+    pub hooks: Hooks,
+    /// Total uncompressed size of `payload/`, in bytes, computed at build
+    /// time (`package::build`). Used for the pre-download/pre-extract
+    /// free-space check (`install::diskspace`) — checked *before*
+    /// spending bandwidth on a download that could never fit, not just
+    /// before extraction. `#[serde(default)]` so a manifest built before
+    /// this field existed still loads; its install just skips the
+    /// early-refusal (the post-extraction disk-full case, while messier,
+    /// was already the only behavior before this field existed at all).
+    #[serde(default)]
+    pub installed_size_bytes: u64,
 }
