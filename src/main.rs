@@ -210,41 +210,40 @@ fn main() -> ExitCode {
                 }
                 for issue in &issues {
                     match &issue.path {
-                        Some(path) => println!(
-                            "{}: {}: {}",
-                            issue.package,
-                            path.display(),
-                            issue.problem
-                        ),
+                        Some(path) => {
+                            println!("{}: {}: {}", issue.package, path.display(), issue.problem)
+                        }
                         None => println!("{}: {}", issue.package, issue.problem),
                     }
                 }
             }),
 
-        Commands::History { limit } => service
-            .history(*limit)
-            .map_err(|e| e.to_string())
-            .map(|entries| {
-                if json {
-                    print_json(&entries);
-                    return;
-                }
-                if entries.is_empty() {
-                    println!("mitos-pkg: no history recorded yet");
-                    return;
-                }
-                for entry in &entries {
-                    let versions = match (&entry.from_version, &entry.to_version) {
-                        (Some(from), Some(to)) => format!(" {from} -> {to}"),
-                        (None, Some(to)) => format!(" {to}"),
-                        _ => String::new(),
-                    };
-                    println!(
-                        "{} {} {}{}",
-                        entry.timestamp, entry.operation, entry.package, versions
-                    );
-                }
-            }),
+        Commands::History { limit } => {
+            service
+                .history(*limit)
+                .map_err(|e| e.to_string())
+                .map(|entries| {
+                    if json {
+                        print_json(&entries);
+                        return;
+                    }
+                    if entries.is_empty() {
+                        println!("mitos-pkg: no history recorded yet");
+                        return;
+                    }
+                    for entry in &entries {
+                        let versions = match (&entry.from_version, &entry.to_version) {
+                            (Some(from), Some(to)) => format!(" {from} -> {to}"),
+                            (None, Some(to)) => format!(" {to}"),
+                            _ => String::new(),
+                        };
+                        println!(
+                            "{} {} {}{}",
+                            entry.timestamp, entry.operation, entry.package, versions
+                        );
+                    }
+                })
+        }
 
         Commands::Update => service.update().map_err(|e| e.to_string()).map(|()| {
             if json {
@@ -255,16 +254,13 @@ fn main() -> ExitCode {
             }
         }),
 
-        Commands::Clean => service
-            .clean()
-            .map_err(|e| e.to_string())
-            .map(|freed| {
-                if json {
-                    print_json(&CleanResultJson { freed_bytes: freed });
-                } else {
-                    println!("mitos-pkg: freed {freed} bytes");
-                }
-            }),
+        Commands::Clean => service.clean().map_err(|e| e.to_string()).map(|freed| {
+            if json {
+                print_json(&CleanResultJson { freed_bytes: freed });
+            } else {
+                println!("mitos-pkg: freed {freed} bytes");
+            }
+        }),
 
         Commands::Build { .. } => unreachable!("handled before service setup above"),
     };
@@ -301,7 +297,11 @@ fn print_install_result(dry_run: bool, packages: Vec<(String, semver::Version)>,
         println!("mitos-pkg: nothing to install");
         return;
     }
-    let verb = if dry_run { "would install" } else { "installed" };
+    let verb = if dry_run {
+        "would install"
+    } else {
+        "installed"
+    };
     for (name, version) in &packages {
         println!("{verb}: {name} {version}");
     }

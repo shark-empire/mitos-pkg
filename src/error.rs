@@ -70,7 +70,9 @@ pub enum PkgError {
         host_arch: String,
     },
 
-    #[error("not enough free space at the install root: need {needed} bytes, {available} available")]
+    #[error(
+        "not enough free space at the install root: need {needed} bytes, {available} available"
+    )]
     InsufficientDiskSpace { needed: u64, available: u64 },
 
     #[error("'{0}' is an essential package — pass --force to remove it anyway")]
