@@ -87,14 +87,12 @@ impl PackageService {
     /// packages against (see `package::arch`): `Config::target_arch` if
     /// set, otherwise whatever CPU architecture this process itself is
     /// running on.
-fn effective_arch(&self) -> &str {
-    self.config
-        .target_arch
-        .as_deref()
-        .unwrap_or_else(|| arch::host_arch()) 
-}
-
-    
+    fn effective_arch(&self) -> &str {
+        self.config
+            .target_arch
+            .as_deref()
+            .unwrap_or_else(|| arch::host_arch())
+    }
 
     /// Refreshes the local index cache from every configured repository
     /// and merges them into one in-memory + on-disk index.
