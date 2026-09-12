@@ -1,4 +1,4 @@
-name: TEST-MITOS-apk
+name: TEST MITOS-apk
 
 on: [push, pull_request]
 
