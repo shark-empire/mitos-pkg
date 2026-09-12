@@ -263,7 +263,9 @@ impl PackageService {
         progress: &mut Progress,
     ) -> Result<Vec<(String, Version)>> {
         let path = Path::new(spec);
-        if path.extension().and_then(|e| e.to_str()) == Some(format::PACKAGE_EXTENSION) && path.is_file() {
+        if path.extension().and_then(|e| e.to_str()) == Some(format::PACKAGE_EXTENSION)
+            && path.is_file()
+        {
             return self.install_local_with_progress(path, signature_hex, dry_run, progress);
         }
 
@@ -271,7 +273,10 @@ impl PackageService {
         let (name, req) = parse_pinned(spec)?;
 
         if let Some(existing) = self.packages.get(&name) {
-            return Err(PkgError::AlreadyInstalled(name, existing.version.to_string()));
+            return Err(PkgError::AlreadyInstalled(
+                name,
+                existing.version.to_string(),
+            ));
         }
 
         progress.emit(ProgressEvent::Resolving {
@@ -349,7 +354,12 @@ impl PackageService {
         signature_hex: Option<&str>,
         dry_run: bool,
     ) -> Result<Vec<(String, Version)>> {
-        self.install_local_with_progress(archive_path, signature_hex, dry_run, &mut Progress::none())
+        self.install_local_with_progress(
+            archive_path,
+            signature_hex,
+            dry_run,
+            &mut Progress::none(),
+        )
     }
 
     /// Same as `install_local`, reporting verify/install steps as they
@@ -646,7 +656,11 @@ impl PackageService {
             }
 
             self.check_upgrade_safe(pkg_name, &latest.version)?;
-            planned.push((pkg_name.clone(), installed.version.clone(), latest.version.clone()));
+            planned.push((
+                pkg_name.clone(),
+                installed.version.clone(),
+                latest.version.clone(),
+            ));
         }
 
         if dry_run || planned.is_empty() {
@@ -808,7 +822,10 @@ impl PackageService {
 
             progress.emit(ProgressEvent::Removing { name: name.clone() });
             self.remove_one(&name)?;
-            history::append(&self.config.history_path(), &HistoryEntry::new("autoremove", &name));
+            history::append(
+                &self.config.history_path(),
+                &HistoryEntry::new("autoremove", &name),
+            );
             removed.push(name);
         }
 

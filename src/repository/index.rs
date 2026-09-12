@@ -115,7 +115,11 @@ impl RepositoryIndex {
         let q = query.to_lowercase();
         self.packages
             .values()
-            .filter_map(|versions| versions.iter().max_by_key(|m| (m.version.clone(), m.priority)))
+            .filter_map(|versions| {
+                versions
+                    .iter()
+                    .max_by_key(|m| (m.version.clone(), m.priority))
+            })
             .filter(|m| {
                 m.name.to_lowercase().contains(&q) || m.description.to_lowercase().contains(&q)
             })

@@ -206,7 +206,12 @@ impl DaemonClient {
     /// Reports what `remove` would do — including refusing the same way a
     /// real call would (dependents in the way, or an essential package
     /// without `force`) — without removing anything.
-    pub fn remove_dry_run(&mut self, name: &str, cascade: bool, force: bool) -> ClientResult<Vec<String>> {
+    pub fn remove_dry_run(
+        &mut self,
+        name: &str,
+        cascade: bool,
+        force: bool,
+    ) -> ClientResult<Vec<String>> {
         match self.call_quiet(Request::Remove {
             name: name.to_string(),
             cascade,

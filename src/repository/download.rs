@@ -74,8 +74,7 @@ pub fn fetch_with_mirrors(fetcher: &dyn Fetcher, urls: &[&str]) -> Result<Vec<u8
             Err(e) => last_err = Some(e),
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| PkgError::Network("no repository URL configured".to_string())))
+    Err(last_err.unwrap_or_else(|| PkgError::Network("no repository URL configured".to_string())))
 }
 
 /// Downloads `url` (retrying transient failures), verifies it against

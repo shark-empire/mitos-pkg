@@ -17,7 +17,9 @@ use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(name = "mitos-pkgd")]
-#[command(about = "Background service for mitos-pkg — lets unprivileged clients (mitos-gui, mitos-settings, mitos-pkg itself) install/remove/search/query packages over a local socket instead of needing a terminal and root access directly")]
+#[command(
+    about = "Background service for mitos-pkg — lets unprivileged clients (mitos-gui, mitos-settings, mitos-pkg itself) install/remove/search/query packages over a local socket instead of needing a terminal and root access directly"
+)]
 struct Args {
     /// Override the config file location (default: /etc/mitos-pkg/config.json)
     #[arg(long)]

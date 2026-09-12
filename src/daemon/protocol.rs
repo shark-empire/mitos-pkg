@@ -171,7 +171,8 @@ pub enum ResponsePayload {
 /// in a buffer instead of on the wire looks identical to a hung daemon
 /// from the other end.
 pub fn write_json_line<W: Write, T: Serialize>(w: &mut W, value: &T) -> io::Result<()> {
-    serde_json::to_writer(&mut *w, value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    serde_json::to_writer(&mut *w, value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     w.write_all(b"\n")?;
     w.flush()
 }
@@ -179,7 +180,9 @@ pub fn write_json_line<W: Write, T: Serialize>(w: &mut W, value: &T) -> io::Resu
 /// Reads and deserializes the next non-blank JSON line. `Ok(None)` means
 /// the peer closed the connection (clean EOF), not "the line was
 /// invalid" — a genuinely malformed line is `Err`, distinct from either.
-pub fn read_json_line<R: BufRead, T: for<'de> Deserialize<'de>>(r: &mut R) -> io::Result<Option<T>> {
+pub fn read_json_line<R: BufRead, T: for<'de> Deserialize<'de>>(
+    r: &mut R,
+) -> io::Result<Option<T>> {
     loop {
         let mut line = String::new();
         let n = r.read_line(&mut line)?;

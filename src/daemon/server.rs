@@ -253,7 +253,10 @@ fn dispatch(request: Request, service: &Arc<RwLock<PackageService>>, writer: &mu
                 let mut svc = service.write().expect("package service lock poisoned");
                 let mut progress = Progress::new(&mut emit_progress);
                 svc.autoremove_with_progress(&mut progress)
-                    .map(|names| ResponsePayload::Removed { names, dry_run: false })
+                    .map(|names| ResponsePayload::Removed {
+                        names,
+                        dry_run: false,
+                    })
             }
             Request::Update => {
                 let mut svc = service.write().expect("package service lock poisoned");

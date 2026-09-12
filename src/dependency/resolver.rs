@@ -43,7 +43,11 @@ enum VisitError {
 const MAX_RESTARTS: usize = 200;
 
 impl<'a> Resolver<'a> {
-    pub fn new(index: &'a RepositoryIndex, installed: &'a InstalledDb, target_arch: &'a str) -> Self {
+    pub fn new(
+        index: &'a RepositoryIndex,
+        installed: &'a InstalledDb,
+        target_arch: &'a str,
+    ) -> Self {
         Self {
             index,
             installed,
@@ -86,7 +90,11 @@ impl<'a> Resolver<'a> {
     /// fully needs real backjumping (or a PubGrub-style solver), a larger
     /// undertaking than this tool currently warrants — see README
     /// "Status".
-    pub fn resolve_install_req(&self, root_name: &str, root_req: &VersionReq) -> Result<InstallPlan> {
+    pub fn resolve_install_req(
+        &self,
+        root_name: &str,
+        root_req: &VersionReq,
+    ) -> Result<InstallPlan> {
         let mut extra_reqs: HashMap<String, VersionReq> = HashMap::new();
 
         for _ in 0..MAX_RESTARTS {
@@ -184,10 +192,15 @@ impl<'a> Resolver<'a> {
         }
 
         if !visiting.insert(name.to_string()) {
-            return Err(VisitError::Fatal(PkgError::CircularDependency(name.to_string())));
+            return Err(VisitError::Fatal(PkgError::CircularDependency(
+                name.to_string(),
+            )));
         }
 
-        let candidate = match self.index.best_match_for_arch(name, &effective_req, self.target_arch) {
+        let candidate = match self
+            .index
+            .best_match_for_arch(name, &effective_req, self.target_arch)
+        {
             Some(c) => c.clone(),
             None => {
                 // Distinguish "nothing installable here" from "nothing at
@@ -352,7 +365,10 @@ impl<'a> Resolver<'a> {
         !self.installed.all().iter().any(|(other_name, other_pkg)| {
             other_name.as_str() != candidate
                 && (other_name.as_str() == dep_name
-                    || other_pkg.provides.iter().any(|provided| provided == dep_name))
+                    || other_pkg
+                        .provides
+                        .iter()
+                        .any(|provided| provided == dep_name))
         })
     }
 }

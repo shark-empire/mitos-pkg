@@ -170,7 +170,9 @@ impl<'a> Transaction<'a> {
     }
 
     fn staging_dir(&self, package_name: &str) -> PathBuf {
-        self.install_root.join(".mitos-pkg-staging").join(package_name)
+        self.install_root
+            .join(".mitos-pkg-staging")
+            .join(package_name)
     }
 
     /// Removes an installed package: runs `pre_remove` (if any) while
