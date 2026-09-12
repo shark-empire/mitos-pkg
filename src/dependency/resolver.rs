@@ -17,11 +17,38 @@ pub struct InstallPlan {
 pub struct Resolver<'a> {
     index: &'a RepositoryIndex,
     installed: &'a InstalledDb,
+    /// Architecture every candidate must be installable on (see
+    /// `package::arch`). Not `Config::target_arch` itself — callers pass
+    /// the already-resolved effective value (`PackageService::effective_arch`)
+    /// so this module doesn't need to know `Config` exists.
+    target_arch: &'a str,
 }
 
+/// Internal control-flow signal used only inside backtracking resolution
+/// (never surfaces outside this module): either a genuinely unrecoverable
+/// failure, or a request to retry a specific package's candidate choice
+/// with an additionally-learned requirement folded in. See
+/// `Resolver::resolve_install_req`'s doc comment for how `Narrow` drives
+/// the restart loop, and why that's sound.
+enum VisitError {
+    Fatal(PkgError),
+    Narrow(String, VersionReq),
+}
+
+/// Cap on how many times resolution restarts with a newly-learned
+/// requirement before giving up. Each restart strictly narrows (never
+/// widens) some package's accumulated requirement, so termination is
+/// guaranteed well before this in any real dependency graph; it exists
+/// purely as a safety valve against a pathological/malicious index.
+const MAX_RESTARTS: usize = 200;
+
 impl<'a> Resolver<'a> {
-    pub fn new(index: &'a RepositoryIndex, installed: &'a InstalledDb) -> Self {
-        Self { index, installed }
+    pub fn new(index: &'a RepositoryIndex, installed: &'a InstalledDb, target_arch: &'a str) -> Self {
+        Self {
+            index,
+            installed,
+            target_arch,
+        }
     }
 
     /// Resolves `root_name` — at whatever version `latest()` would pick —
@@ -34,53 +61,85 @@ impl<'a> Resolver<'a> {
 
     /// Resolves `root_name` against `root_req` (e.g. an exact-version pin
     /// from `mitos-pkg install name@1.2.3`) and its full transitive
-    /// dependency tree. Packages already installed are treated as
-    /// satisfied *only if their installed version actually matches the
-    /// requirement that pulled them in* — mitos-pkg does not silently
-    /// accept an installed version that doesn't meet a fresh requirement,
-    /// nor does it auto-upgrade to fix that; it reports the conflict and
-    /// leaves the decision to the caller (run `upgrade` first).
+    /// dependency tree, on packages installable on `target_arch`.
     ///
-    /// Resolution is greedy, not backtracking: each package name is
-    /// assigned a candidate version the first time it's reached, and
-    /// every later requirement on that same name is checked against that
-    /// one choice rather than being solved jointly (the way a SAT-based
-    /// resolver like apt's or a PubGrub-based one like cargo's would). A
-    /// diamond where two branches need genuinely incompatible ranges of
-    /// the same package is reported as a conflict rather than resolved by
-    /// trying a different candidate order — a deliberate, documented
-    /// trade-off for a tool this size (see README "Status").
-    pub fn resolve_install_req(
-        &self,
-        root_name: &str,
-        root_req: &VersionReq,
-    ) -> Result<InstallPlan> {
-        let mut graph = DependencyGraph::new();
-        let mut resolved: HashMap<String, PackageMetadata> = HashMap::new();
-        let mut visiting: HashSet<String> = HashSet::new();
+    /// This is a **restart-based, requirement-narrowing search**: each
+    /// attempt runs the same single-pass, first-candidate-wins visit a
+    /// purely greedy resolver would, but a requirement conflict
+    /// discovered against an already-resolved name no longer fails
+    /// immediately. Instead it's folded — via `semver` comparator-list
+    /// concatenation, which is exactly requirement intersection given
+    /// `VersionReq`'s AND-of-all-comparators semantics (there is no OR in
+    /// Cargo's version-requirement syntax to worry about colliding with)
+    /// — into that name's accumulated requirement in `extra_reqs`, and
+    /// the *entire* resolution restarts from the root with that extra
+    /// constraint in place, so the shared package is picked correctly
+    /// from the very first visit next time. `extra_reqs` only ever grows
+    /// more restrictive across restarts, which is what guarantees
+    /// termination (bounded by `MAX_RESTARTS`) without needing true
+    /// conflict-directed backjumping.
+    ///
+    /// What this *doesn't* solve: two acceptable versions of a shared
+    /// package whose version ranges are individually compatible but whose
+    /// own *transitive dependencies* conflict — that's still reported as
+    /// `DependencyConflict` rather than searched around. Closing that gap
+    /// fully needs real backjumping (or a PubGrub-style solver), a larger
+    /// undertaking than this tool currently warrants — see README
+    /// "Status".
+    pub fn resolve_install_req(&self, root_name: &str, root_req: &VersionReq) -> Result<InstallPlan> {
+        let mut extra_reqs: HashMap<String, VersionReq> = HashMap::new();
 
-        self.visit(root_name, root_req, None, &mut graph, &mut resolved, &mut visiting)?;
+        for _ in 0..MAX_RESTARTS {
+            let mut graph = DependencyGraph::new();
+            let mut resolved: HashMap<String, PackageMetadata> = HashMap::new();
+            let mut visiting: HashSet<String> = HashSet::new();
 
-        let order: Vec<PackageMetadata> = graph
-            .install_order()?
-            .into_iter()
-            .filter_map(|name| resolved.remove(&name))
-            .collect();
+            match self.visit(
+                root_name,
+                root_req,
+                None,
+                &extra_reqs,
+                &mut graph,
+                &mut resolved,
+                &mut visiting,
+            ) {
+                Ok(()) => {
+                    let order: Vec<PackageMetadata> = graph
+                        .install_order()?
+                        .into_iter()
+                        .filter_map(|name| resolved.remove(&name))
+                        .collect();
+                    self.check_conflicts(&order)?;
+                    return Ok(InstallPlan { order });
+                }
+                Err(VisitError::Narrow(name, req)) => {
+                    let combined = match extra_reqs.get(&name) {
+                        Some(existing) => intersect_req(existing, &req),
+                        None => req,
+                    };
+                    extra_reqs.insert(name, combined);
+                    continue;
+                }
+                Err(VisitError::Fatal(e)) => return Err(e),
+            }
+        }
 
-        self.check_conflicts(&order)?;
-
-        Ok(InstallPlan { order })
+        Err(PkgError::DependencyConflict(format!(
+            "could not find a mutually compatible set of versions for '{root_name}' after {MAX_RESTARTS} attempts — the dependency graph likely has no valid solution"
+        )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         &self,
         name: &str,
         req: &VersionReq,
         required_by: Option<&str>,
+        extra_reqs: &HashMap<String, VersionReq>,
         graph: &mut DependencyGraph,
         resolved: &mut HashMap<String, PackageMetadata>,
         visiting: &mut HashSet<String>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), VisitError> {
         // Record the node/edge unconditionally, even for already-satisfied
         // or already-visited packages, so ordering among siblings that
         // share a dependency (diamonds) still comes out right.
@@ -89,16 +148,19 @@ impl<'a> Resolver<'a> {
             graph.add_edge(parent, name);
         }
 
-        // Already picked a candidate for this name in this resolution —
-        // the requirement that brought us back here must still hold
-        // against that one choice (see `resolve_install_req` docs on why
-        // this doesn't backtrack to try a different version instead).
+        let effective_req = match extra_reqs.get(name) {
+            Some(extra) => intersect_req(req, extra),
+            None => req.clone(),
+        };
+
+        // Already picked a candidate for this name in this attempt — the
+        // requirement that brought us back here must still hold against
+        // that one choice. If it doesn't, this is exactly the diamond
+        // case `resolve_install_req`'s doc comment describes: signal a
+        // restart rather than failing outright.
         if let Some(existing) = resolved.get(name) {
-            if !req.matches(&existing.version) {
-                return Err(PkgError::DependencyConflict(format!(
-                    "'{}' requires '{name} {req}', but {name} {} was already selected to satisfy another dependency in this install",
-                    required_by.unwrap_or(name), existing.version
-                )));
+            if !effective_req.matches(&existing.version) {
+                return Err(VisitError::Narrow(name.to_string(), effective_req));
             }
             return Ok(());
         }
@@ -106,32 +168,55 @@ impl<'a> Resolver<'a> {
         // Already on the system — fine, *provided* the installed version
         // actually meets this requirement. mitos-pkg intentionally does
         // not auto-upgrade transitively pulled-in dependencies just
-        // because a new requirement showed up (see module docs); it
-        // surfaces the mismatch instead.
+        // because a new requirement showed up; it surfaces the mismatch
+        // instead. Unlike a not-yet-resolved candidate, there's no
+        // "different version to try" here — the installed version is
+        // fixed truth — so this is always `Fatal`, never `Narrow`.
         if let Some(installed_pkg) = self.installed.get(name) {
-            if !req.matches(&installed_pkg.version) {
-                return Err(PkgError::DependencyConflict(format!(
-                    "installed '{name} {}' does not satisfy '{name} {req}' required by '{}' — upgrade it first",
-                    installed_pkg.version, required_by.unwrap_or(name)
-                )));
+            if !effective_req.matches(&installed_pkg.version) {
+                return Err(VisitError::Fatal(PkgError::DependencyConflict(format!(
+                    "installed '{name} {}' does not satisfy '{name} {effective_req}' required by '{}' — upgrade it first",
+                    installed_pkg.version,
+                    required_by.unwrap_or(name)
+                ))));
             }
             return Ok(());
         }
 
         if !visiting.insert(name.to_string()) {
-            return Err(PkgError::CircularDependency(name.to_string()));
+            return Err(VisitError::Fatal(PkgError::CircularDependency(name.to_string())));
         }
 
-        let candidate = self.index.best_match(name, req).cloned().ok_or_else(|| {
-            if self.index.packages.contains_key(name) {
-                PkgError::NoMatchingVersion {
-                    name: name.to_string(),
-                    requirement: req.to_string(),
+        let candidate = match self.index.best_match_for_arch(name, &effective_req, self.target_arch) {
+            Some(c) => c.clone(),
+            None => {
+                // Distinguish "nothing installable here" from "nothing at
+                // all matches" so the error actually points at the real
+                // cause rather than looking like a missing package.
+                if let Some(wrong_arch) = self.index.best_match(name, &effective_req) {
+                    return Err(VisitError::Fatal(PkgError::ArchMismatch {
+                        name: name.to_string(),
+                        package_arch: wrong_arch.arch.clone(),
+                        host_arch: self.target_arch.to_string(),
+                    }));
                 }
-            } else {
-                PkgError::PackageNotFound(name.to_string())
+                let err = if self.index.packages.contains_key(name) {
+                    if extra_reqs.contains_key(name) {
+                        PkgError::DependencyConflict(format!(
+                            "no version of '{name}' satisfies every requirement placed on it across this install (combined: {effective_req})"
+                        ))
+                    } else {
+                        PkgError::NoMatchingVersion {
+                            name: name.to_string(),
+                            requirement: effective_req.to_string(),
+                        }
+                    }
+                } else {
+                    PkgError::PackageNotFound(name.to_string())
+                };
+                return Err(VisitError::Fatal(err));
             }
-        })?;
+        };
 
         for dep in &candidate.dependencies {
             // A dependency can be satisfied either by a real package at a
@@ -139,19 +224,30 @@ impl<'a> Resolver<'a> {
             // matches — by whatever package declares it as a virtual
             // `provides`. Either way we recurse on the *real* package
             // name, since that's what actually needs installing.
-            match self.index.best_match(&dep.name, &dep.version_req) {
+            match self
+                .index
+                .best_match_for_arch(&dep.name, &dep.version_req, self.target_arch)
+            {
                 Some(_) => {
-                    self.visit(&dep.name, &dep.version_req, Some(name), graph, resolved, visiting)?;
+                    self.visit(
+                        &dep.name,
+                        &dep.version_req,
+                        Some(name),
+                        extra_reqs,
+                        graph,
+                        resolved,
+                        visiting,
+                    )?;
                 }
                 None => {
                     let provider = self
                         .index
-                        .find_provider(&dep.name)
+                        .find_provider_for_arch(&dep.name, self.target_arch)
                         .ok_or_else(|| {
-                            PkgError::DependencyConflict(format!(
+                            VisitError::Fatal(PkgError::DependencyConflict(format!(
                                 "no version of '{}' satisfies '{}' required by '{}'",
                                 dep.name, dep.version_req, name
-                            ))
+                            )))
                         })?
                         .name
                         .clone();
@@ -164,6 +260,7 @@ impl<'a> Resolver<'a> {
                         &provider,
                         &VersionReq::STAR,
                         Some(name),
+                        extra_reqs,
                         graph,
                         resolved,
                         visiting,
@@ -260,12 +357,37 @@ impl<'a> Resolver<'a> {
     }
 }
 
+/// Concatenates two `VersionReq`s' comparator lists. Correct as an
+/// intersection specifically because of how `semver::VersionReq` matching
+/// works: a version matches a `VersionReq` only if it satisfies *every*
+/// comparator in it, so the union of two comparator lists matches exactly
+/// the versions that would have matched both original requirements.
+/// Implemented via `Display`/`parse` round-trip (`a.to_string()` +
+/// `b.to_string()`, comma-joined, re-parsed) rather than constructing a
+/// `VersionReq` from its `comparators` field directly — both are public
+/// API this crate already relies on elsewhere, but going through the
+/// string form sidesteps ever needing to assume anything about the
+/// struct's exact internal representation.
+fn intersect_req(a: &VersionReq, b: &VersionReq) -> VersionReq {
+    if a.comparators.is_empty() {
+        return b.clone();
+    }
+    if b.comparators.is_empty() {
+        return a.clone();
+    }
+    let combined = format!("{a}, {b}");
+    VersionReq::parse(&combined).unwrap_or_else(|_| a.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::database::packages::InstalledPackage;
     use crate::dependency::version::Dependency;
+    use crate::package::hooks::Hooks;
     use semver::Version;
+
+    const HOST: &str = "x86_64";
 
     fn meta(name: &str, version: &str) -> PackageMetadata {
         PackageMetadata {
@@ -279,6 +401,10 @@ mod tests {
             sha256: String::new(),
             signature: None,
             size_bytes: 0,
+            arch: vec!["any".to_string()],
+            essential: false,
+            installed_size_bytes: 0,
+            priority: 0,
         }
     }
 
@@ -293,6 +419,10 @@ mod tests {
             installed_files: Vec::new(),
             explicit: true,
             held: false,
+            arch: vec!["any".to_string()],
+            essential: false,
+            hooks: Hooks::default(),
+            payload_sha256: String::new(),
         }
     }
 
@@ -316,7 +446,7 @@ mod tests {
             .insert("mitos-libc-musl".to_string(), vec![libc_impl]);
 
         let installed = InstalledDb::default();
-        let plan = Resolver::new(&index, &installed)
+        let plan = Resolver::new(&index, &installed, HOST)
             .resolve_install("app")
             .unwrap();
 
@@ -336,7 +466,7 @@ mod tests {
         let mut installed = InstalledDb::default();
         installed.insert(installed_pkg("legacy-app", "0.9.0"));
 
-        let err = Resolver::new(&index, &installed)
+        let err = Resolver::new(&index, &installed, HOST)
             .resolve_install("app")
             .unwrap_err();
         assert!(matches!(err, PkgError::DependencyConflict(_)));
@@ -346,11 +476,6 @@ mod tests {
     fn dependency_resolves_to_a_version_that_actually_satisfies_the_requirement() {
         use semver::VersionReq;
 
-        // Two versions of the same dependency exist; only the older one
-        // satisfies the requirement. A resolver that greedily grabs
-        // whatever's newest (the bug this test guards against) would
-        // pick 0.5.0 and silently violate the requirement it just
-        // confirmed *some* version could satisfy.
         let mut app = meta("app", "1.0.0");
         app.dependencies.push(Dependency {
             name: "mitos-libc".to_string(),
@@ -365,7 +490,7 @@ mod tests {
         );
 
         let installed = InstalledDb::default();
-        let plan = Resolver::new(&index, &installed)
+        let plan = Resolver::new(&index, &installed, HOST)
             .resolve_install("app")
             .unwrap();
 
@@ -387,7 +512,7 @@ mod tests {
 
         let installed = InstalledDb::default();
         let req = VersionReq::parse("=1.0.0").unwrap();
-        let plan = Resolver::new(&index, &installed)
+        let plan = Resolver::new(&index, &installed, HOST)
             .resolve_install_req("app", &req)
             .unwrap();
 
@@ -400,13 +525,10 @@ mod tests {
         use semver::VersionReq;
 
         // app depends on both `net` and `old-client`; `net` wants a
-        // recent `libc`, `old-client` needs an older major. Both
-        // requirements are independently satisfiable (1.5.0 and 2.5.0
-        // both exist), but not by the *same* version — since this
-        // resolver commits to one version per name the first time it's
-        // reached rather than backtracking, that must surface as an
-        // error rather than silently keeping whichever version was
-        // picked first.
+        // recent `libc`, `old-client` needs an older major, and no
+        // single version of `libc` can satisfy both — this must surface
+        // as a conflict even from a resolver that backtracks, since no
+        // amount of retrying finds a version that doesn't exist.
         let mut app = meta("app", "1.0.0");
         app.dependencies.push(Dependency {
             name: "net".to_string(),
@@ -441,10 +563,96 @@ mod tests {
         );
 
         let installed = InstalledDb::default();
-        let err = Resolver::new(&index, &installed)
+        let err = Resolver::new(&index, &installed, HOST)
             .resolve_install("app")
             .unwrap_err();
         assert!(matches!(err, PkgError::DependencyConflict(_)));
+    }
+
+    #[test]
+    fn diamond_with_a_real_solution_is_backtracked_into_instead_of_rejected() {
+        use semver::VersionReq;
+
+        // Same shape as the test above, but this time a version of
+        // `libc` genuinely satisfies both branches (1.5.0 is both
+        // `>=1.0.0,<3.0.0` *and* `<2.0.0`) — just not the newest one a
+        // purely greedy, non-backtracking resolver would grab for `net`
+        // on its first visit. This is the exact case
+        // `resolve_install_req`'s restart-based search exists for.
+        let mut app = meta("app", "1.0.0");
+        app.dependencies.push(Dependency {
+            name: "net".to_string(),
+            version_req: VersionReq::parse("*").unwrap(),
+        });
+        app.dependencies.push(Dependency {
+            name: "old-client".to_string(),
+            version_req: VersionReq::parse("*").unwrap(),
+        });
+
+        let mut net = meta("net", "1.0.0");
+        net.dependencies.push(Dependency {
+            name: "libc".to_string(),
+            version_req: VersionReq::parse(">=1.0.0, <3.0.0").unwrap(),
+        });
+
+        let mut old_client = meta("old-client", "1.0.0");
+        old_client.dependencies.push(Dependency {
+            name: "libc".to_string(),
+            version_req: VersionReq::parse("<2.0.0").unwrap(),
+        });
+
+        let mut index = RepositoryIndex::default();
+        index.packages.insert("app".to_string(), vec![app]);
+        index.packages.insert("net".to_string(), vec![net]);
+        index
+            .packages
+            .insert("old-client".to_string(), vec![old_client]);
+        index.packages.insert(
+            "libc".to_string(),
+            vec![meta("libc", "1.5.0"), meta("libc", "2.5.0")],
+        );
+
+        let installed = InstalledDb::default();
+        let plan = Resolver::new(&index, &installed, HOST)
+            .resolve_install("app")
+            .expect("a mutually compatible version (1.5.0) exists and should be found");
+
+        let libc = plan
+            .order
+            .iter()
+            .find(|p| p.name == "libc")
+            .expect("libc should be in the plan");
+        assert_eq!(libc.version, Version::parse("1.5.0").unwrap());
+    }
+
+    #[test]
+    fn arch_mismatched_candidate_is_reported_distinctly() {
+        let mut app = meta("app", "1.0.0");
+        app.arch = vec!["aarch64".to_string()];
+
+        let mut index = RepositoryIndex::default();
+        index.packages.insert("app".to_string(), vec![app]);
+
+        let installed = InstalledDb::default();
+        let err = Resolver::new(&index, &installed, "x86_64")
+            .resolve_install("app")
+            .unwrap_err();
+        assert!(matches!(err, PkgError::ArchMismatch { .. }));
+    }
+
+    #[test]
+    fn arch_compatible_candidate_resolves_normally() {
+        let mut app = meta("app", "1.0.0");
+        app.arch = vec!["x86_64".to_string(), "aarch64".to_string()];
+
+        let mut index = RepositoryIndex::default();
+        index.packages.insert("app".to_string(), vec![app]);
+
+        let installed = InstalledDb::default();
+        let plan = Resolver::new(&index, &installed, "aarch64")
+            .resolve_install("app")
+            .unwrap();
+        assert_eq!(plan.order.len(), 1);
     }
 
     #[test]
@@ -463,7 +671,7 @@ mod tests {
         libc_impl.provides.push("mitos-libc".to_string());
         installed.insert(libc_impl);
 
-        let resolver = Resolver::new(&index, &installed);
+        let resolver = Resolver::new(&index, &installed, HOST);
         let dependents = resolver.dependents_of("mitos-libc-musl");
         assert_eq!(dependents, vec!["app".to_string()]);
     }
@@ -488,7 +696,7 @@ mod tests {
         glibc.provides.push("mitos-libc".to_string());
         installed.insert(glibc);
 
-        let resolver = Resolver::new(&index, &installed);
+        let resolver = Resolver::new(&index, &installed, HOST);
         // Either provider alone still leaves the other satisfying `app`.
         assert!(resolver.dependents_of("mitos-libc-musl").is_empty());
         assert!(resolver.dependents_of("mitos-libc-glibc").is_empty());
