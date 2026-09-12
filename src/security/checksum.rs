@@ -47,16 +47,28 @@ pub fn hash_files(root: &Path, relative_paths: &[PathBuf]) -> Result<String> {
         let hash = hash_file(&root.join(rel))?;
         entries.push((rel.clone(), hash));
     }
-    entries.sort();
+    Ok(aggregate_hash(&entries))
+}
+
+/// Folds a set of (relative path, file hash) pairs into one aggregate
+/// digest: sorts them for a reproducible order, joins them into a
+/// `sha256sum`-style listing, then hashes that listing. Factored out of
+/// `hash_files` so callers that already have some file hashes and want to
+/// report *which specific file* failed to hash (e.g. `PackageService::verify`,
+/// which distinguishes a missing file from a modified one) can build the
+/// list themselves instead of `hash_files` aborting on the first error.
+pub fn aggregate_hash(entries: &[(PathBuf, String)]) -> String {
+    let mut sorted = entries.to_vec();
+    sorted.sort();
 
     let mut listing = String::new();
-    for (rel, hash) in &entries {
-        listing.push_str(&hash);
+    for (rel, hash) in &sorted {
+        listing.push_str(hash);
         listing.push_str("  ");
         listing.push_str(&rel.to_string_lossy());
         listing.push('\n');
     }
-    Ok(hash_bytes(listing.as_bytes()))
+    hash_bytes(listing.as_bytes())
 }
 
 /// Same as `hash_files`, but walks every file under `dir` recursively
@@ -78,6 +90,18 @@ pub fn list_files(dir: &Path) -> Result<Vec<PathBuf>> {
     collect_relative_paths(dir, dir, &mut paths)?;
     paths.sort();
     Ok(paths)
+}
+
+/// Sums the on-disk size of every file under `dir`, recursively. Used by
+/// `package::build` to populate `Manifest::installed_size_bytes` — the
+/// figure `install::diskspace` checks the target filesystem's free space
+/// against before a download or extraction starts.
+pub fn total_size(dir: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    for rel in list_files(dir)? {
+        total += std::fs::metadata(dir.join(rel))?.len();
+    }
+    Ok(total)
 }
 
 fn collect_relative_paths(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
