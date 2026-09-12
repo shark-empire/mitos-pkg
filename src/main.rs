@@ -3,6 +3,7 @@ use mitos_pkg::cli::{Cli, Commands};
 use mitos_pkg::config::Config;
 use mitos_pkg::package::build;
 use mitos_pkg::service::PackageService;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -19,7 +20,7 @@ fn main() -> ExitCode {
         sign_with,
     } = &cli.command
     {
-        return run_build(source, output.as_deref(), sign_with.as_deref());
+        return run_build(source, output.as_deref(), sign_with.as_deref(), cli.json);
     }
 
     let config_path = cli
@@ -45,107 +46,321 @@ fn main() -> ExitCode {
         }
     };
 
-    let result = match &cli.command {
-        Commands::Install { package_name } => service.install(package_name),
+    let json = cli.json;
+    let dry_run = cli.dry_run;
+
+    let outcome: Result<(), String> = match &cli.command {
+        Commands::Install {
+            package_name,
+            signature,
+        } => service
+            .install(package_name, signature.as_deref(), dry_run)
+            .map_err(|e| e.to_string())
+            .map(|packages| print_install_result(dry_run, packages, json)),
+
         Commands::Remove {
             package_name,
             cascade,
-        } => service.remove(package_name, *cascade).map(|removed| {
-            for name in removed {
-                println!("removed: {name}");
-            }
-        }),
+            force,
+        } => service
+            .remove(package_name, *cascade, *force, dry_run)
+            .map_err(|e| e.to_string())
+            .map(|removed| print_remove_result(dry_run, removed, json)),
+
         Commands::Upgrade {
             package_name,
             ignore_hold,
         } => service
-            .upgrade(package_name.as_deref(), *ignore_hold)
-            .map(|upgraded| {
-                if upgraded.is_empty() {
-                    println!("mitos-pkg: nothing to upgrade");
-                }
-                for (name, from, to) in upgraded {
-                    println!("{name}: {from} -> {to}");
-                }
-            }),
+            .upgrade(package_name.as_deref(), *ignore_hold, dry_run)
+            .map_err(|e| e.to_string())
+            .map(|upgraded| print_upgrade_result(dry_run, upgraded, json)),
+
         Commands::Hold { package_name } => service
             .hold(package_name)
-            .map(|_| println!("held: {package_name}")),
+            .map_err(|e| e.to_string())
+            .map(|_| {
+                if json {
+                    print_json(&StatusJson {
+                        status: "ok",
+                        package: Some(package_name.clone()),
+                    });
+                } else {
+                    println!("held: {package_name}");
+                }
+            }),
+
         Commands::Unhold { package_name } => service
             .unhold(package_name)
-            .map(|_| println!("unheld: {package_name}")),
-        Commands::Autoremove => service.autoremove().map(|removed| {
-            if removed.is_empty() {
-                println!("mitos-pkg: nothing to remove");
-            }
-            for name in removed {
-                println!("removed: {name}");
-            }
-        }),
-        Commands::List => {
-            for (name, pkg) in service.list() {
-                if pkg.held {
-                    println!("{name} {} [held]", pkg.version);
+            .map_err(|e| e.to_string())
+            .map(|_| {
+                if json {
+                    print_json(&StatusJson {
+                        status: "ok",
+                        package: Some(package_name.clone()),
+                    });
                 } else {
-                    println!("{name} {}", pkg.version);
+                    println!("unheld: {package_name}");
+                }
+            }),
+
+        Commands::Autoremove => service
+            .autoremove()
+            .map_err(|e| e.to_string())
+            .map(|removed| print_remove_result(false, removed, json)),
+
+        Commands::List => {
+            let items: Vec<ListItemJson> = service
+                .list()
+                .into_iter()
+                .map(|(name, pkg)| ListItemJson {
+                    name: name.clone(),
+                    version: pkg.version.to_string(),
+                    explicit: pkg.explicit,
+                    held: pkg.held,
+                })
+                .collect();
+            if json {
+                print_json(&items);
+            } else {
+                for item in &items {
+                    if item.held {
+                        println!("{} {} [held]", item.name, item.version);
+                    } else {
+                        println!("{} {}", item.name, item.version);
+                    }
                 }
             }
             Ok(())
         }
+
         Commands::Search { query } => {
-            for meta in service.search(query) {
-                println!("{} {} - {}", meta.name, meta.version, meta.description);
+            let items: Vec<SearchItemJson> = service
+                .search(query)
+                .into_iter()
+                .map(|meta| SearchItemJson {
+                    name: meta.name.clone(),
+                    version: meta.version.to_string(),
+                    description: meta.description.clone(),
+                })
+                .collect();
+            if json {
+                print_json(&items);
+            } else {
+                for item in &items {
+                    println!("{} {} - {}", item.name, item.version, item.description);
+                }
             }
             Ok(())
         }
-        Commands::Info { package_name } => service.info(package_name).map(|info| {
-            println!("name: {}", info.name);
-            println!("version: {}", info.version);
-            if !info.description.is_empty() {
-                println!("description: {}", info.description);
-            }
-            println!("installed: {}", if info.installed { "yes" } else { "no" });
-            if let Some(explicit) = info.explicit {
-                println!(
-                    "explicitly installed: {}",
-                    if explicit { "yes" } else { "no" }
-                );
-            }
-            if let Some(held) = info.held {
-                println!("held: {}", if held { "yes" } else { "no" });
-            }
-            if !info.dependencies.is_empty() {
-                let deps: Vec<String> = info
-                    .dependencies
-                    .iter()
-                    .map(|d| format!("{} {}", d.name, d.version_req))
-                    .collect();
-                println!("dependencies: {}", deps.join(", "));
-            }
-            if !info.provides.is_empty() {
-                println!("provides: {}", info.provides.join(", "));
-            }
-            if !info.conflicts.is_empty() {
-                println!("conflicts: {}", info.conflicts.join(", "));
+
+        Commands::Info { package_name } => service
+            .info(package_name)
+            .map_err(|e| e.to_string())
+            .map(|info| {
+                if json {
+                    print_json(&info);
+                    return;
+                }
+                println!("name: {}", info.name);
+                println!("version: {}", info.version);
+                if !info.description.is_empty() {
+                    println!("description: {}", info.description);
+                }
+                println!("installed: {}", if info.installed { "yes" } else { "no" });
+                if let Some(explicit) = info.explicit {
+                    println!(
+                        "explicitly installed: {}",
+                        if explicit { "yes" } else { "no" }
+                    );
+                }
+                if let Some(held) = info.held {
+                    println!("held: {}", if held { "yes" } else { "no" });
+                }
+                println!("arch: {}", info.arch.join(", "));
+                if info.essential {
+                    println!("essential: yes");
+                }
+                if !info.dependencies.is_empty() {
+                    let deps: Vec<String> = info
+                        .dependencies
+                        .iter()
+                        .map(|d| format!("{} {}", d.name, d.version_req))
+                        .collect();
+                    println!("dependencies: {}", deps.join(", "));
+                }
+                if !info.provides.is_empty() {
+                    println!("provides: {}", info.provides.join(", "));
+                }
+                if !info.conflicts.is_empty() {
+                    println!("conflicts: {}", info.conflicts.join(", "));
+                }
+            }),
+
+        Commands::Verify { package_name } => service
+            .verify(package_name.as_deref())
+            .map_err(|e| e.to_string())
+            .map(|issues| {
+                if json {
+                    print_json(&issues);
+                    return;
+                }
+                if issues.is_empty() {
+                    println!("mitos-pkg: no problems found");
+                    return;
+                }
+                for issue in &issues {
+                    match &issue.path {
+                        Some(path) => println!(
+                            "{}: {}: {}",
+                            issue.package,
+                            path.display(),
+                            issue.problem
+                        ),
+                        None => println!("{}: {}", issue.package, issue.problem),
+                    }
+                }
+            }),
+
+        Commands::History { limit } => service
+            .history(*limit)
+            .map_err(|e| e.to_string())
+            .map(|entries| {
+                if json {
+                    print_json(&entries);
+                    return;
+                }
+                if entries.is_empty() {
+                    println!("mitos-pkg: no history recorded yet");
+                    return;
+                }
+                for entry in &entries {
+                    let versions = match (&entry.from_version, &entry.to_version) {
+                        (Some(from), Some(to)) => format!(" {from} -> {to}"),
+                        (None, Some(to)) => format!(" {to}"),
+                        _ => String::new(),
+                    };
+                    println!(
+                        "{} {} {}{}",
+                        entry.timestamp, entry.operation, entry.package, versions
+                    );
+                }
+            }),
+
+        Commands::Update => service.update().map_err(|e| e.to_string()).map(|()| {
+            if json {
+                print_json(&StatusJson {
+                    status: "ok",
+                    package: None,
+                });
             }
         }),
-        Commands::Update => service.update(),
+
         Commands::Clean => service
             .clean()
-            .map(|freed| println!("mitos-pkg: freed {freed} bytes")),
+            .map_err(|e| e.to_string())
+            .map(|freed| {
+                if json {
+                    print_json(&CleanResultJson { freed_bytes: freed });
+                } else {
+                    println!("mitos-pkg: freed {freed} bytes");
+                }
+            }),
+
         Commands::Build { .. } => unreachable!("handled before service setup above"),
     };
 
-    match result {
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("mitos-pkg: {e}");
+            if json {
+                print_json(&ErrorJson { error: e });
+            } else {
+                eprintln!("mitos-pkg: {e}");
+            }
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_build(source: &Path, output: Option<&Path>, sign_with: Option<&Path>) -> ExitCode {
+fn print_install_result(dry_run: bool, packages: Vec<(String, semver::Version)>, json: bool) {
+    if json {
+        let items: Vec<InstalledPkgJson> = packages
+            .iter()
+            .map(|(name, version)| InstalledPkgJson {
+                name: name.clone(),
+                version: version.to_string(),
+            })
+            .collect();
+        print_json(&InstallResultJson {
+            dry_run,
+            packages: items,
+        });
+        return;
+    }
+    if packages.is_empty() {
+        println!("mitos-pkg: nothing to install");
+        return;
+    }
+    let verb = if dry_run { "would install" } else { "installed" };
+    for (name, version) in &packages {
+        println!("{verb}: {name} {version}");
+    }
+}
+
+fn print_remove_result(dry_run: bool, removed: Vec<String>, json: bool) {
+    if json {
+        print_json(&RemoveResultJson { dry_run, removed });
+        return;
+    }
+    if removed.is_empty() {
+        println!("mitos-pkg: nothing to remove");
+        return;
+    }
+    let verb = if dry_run { "would remove" } else { "removed" };
+    for name in &removed {
+        println!("{verb}: {name}");
+    }
+}
+
+fn print_upgrade_result(
+    dry_run: bool,
+    upgraded: Vec<(String, semver::Version, semver::Version)>,
+    json: bool,
+) {
+    if json {
+        let items: Vec<UpgradedPkgJson> = upgraded
+            .iter()
+            .map(|(name, from, to)| UpgradedPkgJson {
+                name: name.clone(),
+                from: from.to_string(),
+                to: to.to_string(),
+            })
+            .collect();
+        print_json(&UpgradeResultJson {
+            dry_run,
+            upgraded: items,
+        });
+        return;
+    }
+    if upgraded.is_empty() {
+        println!("mitos-pkg: nothing to upgrade");
+        return;
+    }
+    for (name, from, to) in &upgraded {
+        if dry_run {
+            println!("would upgrade {name}: {from} -> {to}");
+        } else {
+            println!("{name}: {from} -> {to}");
+        }
+    }
+}
+
+fn run_build(
+    source: &Path,
+    output: Option<&Path>,
+    sign_with: Option<&Path>,
+    json: bool,
+) -> ExitCode {
     let output_dir = output
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -154,7 +369,11 @@ fn run_build(source: &Path, output: Option<&Path>, sign_with: Option<&Path>) -> 
         Some(path) => match load_seed(path) {
             Ok(seed) => Some(seed),
             Err(e) => {
-                eprintln!("mitos-pkg: failed to read signing key: {e}");
+                if json {
+                    print_json(&ErrorJson { error: e });
+                } else {
+                    eprintln!("mitos-pkg: failed to read signing key: {e}");
+                }
                 return ExitCode::FAILURE;
             }
         },
@@ -163,18 +382,32 @@ fn run_build(source: &Path, output: Option<&Path>, sign_with: Option<&Path>) -> 
 
     match build::build_package(source, &output_dir, sign_seed.as_ref()) {
         Ok(out) => {
-            println!(
-                "mitos-pkg: built {} (payload sha256: {})",
-                out.archive_path.display(),
-                out.manifest.payload_sha256
-            );
-            if let Some(sig) = out.signature_hex {
-                println!("mitos-pkg: signature (publish this in your repo index): {sig}");
+            if json {
+                print_json(&BuildResultJson {
+                    archive_path: out.archive_path.display().to_string(),
+                    payload_sha256: out.manifest.payload_sha256,
+                    signature_hex: out.signature_hex,
+                });
+            } else {
+                println!(
+                    "mitos-pkg: built {} (payload sha256: {})",
+                    out.archive_path.display(),
+                    out.manifest.payload_sha256
+                );
+                if let Some(sig) = out.signature_hex {
+                    println!("mitos-pkg: signature (publish this in your repo index): {sig}");
+                }
             }
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("mitos-pkg: build failed: {e}");
+            if json {
+                print_json(&ErrorJson {
+                    error: e.to_string(),
+                });
+            } else {
+                eprintln!("mitos-pkg: build failed: {e}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -189,4 +422,81 @@ fn load_seed(path: &Path) -> std::result::Result<[u8; 32], String> {
     bytes
         .try_into()
         .map_err(|_| "seed must be exactly 32 bytes".to_string())
+}
+
+fn print_json<T: Serialize>(value: &T) {
+    match serde_json::to_string_pretty(value) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("mitos-pkg: failed to serialize JSON output: {e}"),
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorJson {
+    error: String,
+}
+
+#[derive(Serialize)]
+struct StatusJson {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package: Option<String>,
+}
+
+#[derive(Serialize)]
+struct InstalledPkgJson {
+    name: String,
+    version: String,
+}
+
+#[derive(Serialize)]
+struct InstallResultJson {
+    dry_run: bool,
+    packages: Vec<InstalledPkgJson>,
+}
+
+#[derive(Serialize)]
+struct RemoveResultJson {
+    dry_run: bool,
+    removed: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct UpgradedPkgJson {
+    name: String,
+    from: String,
+    to: String,
+}
+
+#[derive(Serialize)]
+struct UpgradeResultJson {
+    dry_run: bool,
+    upgraded: Vec<UpgradedPkgJson>,
+}
+
+#[derive(Serialize)]
+struct ListItemJson {
+    name: String,
+    version: String,
+    explicit: bool,
+    held: bool,
+}
+
+#[derive(Serialize)]
+struct SearchItemJson {
+    name: String,
+    version: String,
+    description: String,
+}
+
+#[derive(Serialize)]
+struct CleanResultJson {
+    freed_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct BuildResultJson {
+    archive_path: String,
+    payload_sha256: String,
+    signature_hex: Option<String>,
 }

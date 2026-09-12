@@ -62,6 +62,26 @@ pub enum PkgError {
 
     #[error("another mitos-pkg operation appears to be in progress (lock file: {0})")]
     Locked(std::path::PathBuf),
+
+    #[error("package '{name}' is built for {package_arch:?}, but this host targets '{host_arch}'")]
+    ArchMismatch {
+        name: String,
+        package_arch: Vec<String>,
+        host_arch: String,
+    },
+
+    #[error("not enough free space at the install root: need {needed} bytes, {available} available")]
+    InsufficientDiskSpace { needed: u64, available: u64 },
+
+    #[error("'{0}' is an essential package — pass --force to remove it anyway")]
+    EssentialPackage(String),
+
+    #[error("{hook} hook for '{package}' failed: {reason}")]
+    HookFailed {
+        package: String,
+        hook: String,
+        reason: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, PkgError>;

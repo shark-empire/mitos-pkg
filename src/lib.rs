@@ -18,7 +18,7 @@
 //! let config = Config::load_or_default(std::path::Path::new(Config::DEFAULT_PATH))?;
 //! let mut service = PackageService::open(config)?;
 //! service.update()?;
-//! service.install("mitos-shell")?;
+//! service.install("mitos-shell", None, false)?;
 //! # Ok(())
 //! # }
 //! ```

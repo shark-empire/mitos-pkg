@@ -14,15 +14,40 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub root: Option<PathBuf>,
 
+    /// Show what a command would do without changing anything. Supported
+    /// by install/remove/upgrade; ignored by read-only and
+    /// non-transactional commands (list, search, info, verify, history,
+    /// hold, unhold, update, clean, build).
+    #[arg(long, global = true)]
+    pub dry_run: bool,
+
+    /// Print machine-readable JSON instead of formatted text — for
+    /// scripts or other MITOS components (mitos-gui, mitos-settings)
+    /// shelling out to the CLI instead of linking the library or talking
+    /// to mitos-pkgd directly.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Install a package and its unmet dependencies. Accepts `name` or
-    /// `name@version` to pin an exact version.
-    Install { package_name: String },
+    /// Install a package and its unmet dependencies. Accepts `name`,
+    /// `name@version` to pin an exact version, or a path to an
+    /// already-built `.mpkg` file to install directly (no repository
+    /// involved — dependencies aren't auto-resolved for a local file).
+    Install {
+        package_name: String,
+        /// Hex-encoded signature to verify a local `.mpkg` file against
+        /// (only meaningful when `package_name` is a path, and only
+        /// required if that package declares a `signer`). Ignored for a
+        /// repository-resolved install, which verifies against the
+        /// index's published signature instead.
+        #[arg(long)]
+        signature: Option<String>,
+    },
     /// Remove an installed package (fails if other packages depend on it,
     /// unless --cascade is given)
     Remove {
@@ -30,6 +55,9 @@ pub enum Commands {
         /// Also remove every installed package that depends on this one
         #[arg(long)]
         cascade: bool,
+        /// Remove even a package marked essential
+        #[arg(long)]
+        force: bool,
     },
     /// Upgrade one package, or every installed package if none is named
     Upgrade {
@@ -50,6 +78,17 @@ pub enum Commands {
     Search { query: String },
     /// Show details for a package (installed, or available in the index)
     Info { package_name: String },
+    /// Re-check installed files' checksums against what was recorded at
+    /// install time, reporting anything missing, unreadable, or modified
+    /// since (mitos-pkg's equivalent of `debsums`/`rpm -Va`). Checks
+    /// every installed package if none is named.
+    Verify { package_name: Option<String> },
+    /// Show the most recent completed install/remove/upgrade operations
+    History {
+        /// How many recent entries to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Refresh the local repository index from configured repositories
     Update,
     /// Delete cached downloaded archives (they're re-fetched and
