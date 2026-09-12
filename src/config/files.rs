@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 /// One configured package repository. Deserializes from either a bare
 /// URL string (every config written before repository signing existed)
-/// or an object naming a required signer — `#[serde(untagged)]` tries
-/// each shape in turn, so old `"repositories": ["https://..."]` configs
-/// keep loading unmodified.
+/// or an object naming a required signer, mirrors, and/or priority —
+/// `#[serde(untagged)]` tries each shape in turn, so old
+/// `"repositories": ["https://..."]` configs keep loading unmodified.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RepoSource {
@@ -14,13 +14,31 @@ pub enum RepoSource {
     Detailed {
         url: String,
         /// If set, `PackageService::update` refuses this repository's
-        /// index unless `{url}.sig` holds a valid Ed25519 signature —
-        /// over the index bytes' SHA-256 digest, by this signer — from a
-        /// key already present in the trusted-keys store. `None` accepts
-        /// an unsigned index, the same opt-in-by-default posture
-        /// `Manifest::signer` takes for individual packages.
+        /// index unless one of its URLs (see `urls()`) serves a valid
+        /// Ed25519 signature — over the index bytes' SHA-256 digest, by
+        /// this signer — from a key already present in the trusted-keys
+        /// store. `None` accepts an unsigned index, the same opt-in-by-
+        /// default posture `Manifest::signer` takes for individual
+        /// packages.
         #[serde(default)]
         signer: Option<String>,
+        /// Additional URLs serving an identical copy of this
+        /// repository's index, tried in order after `url` if it can't be
+        /// reached (see `repository::download::fetch_with_mirrors`).
+        /// Existing configs with no mirrors keep working — this defaults
+        /// to empty, meaning "just `url`, no fallback".
+        #[serde(default)]
+        mirrors: Vec<String>,
+        /// Higher wins when the *same version* of a package is listed by
+        /// more than one configured repository (see
+        /// `repository::index::RepositoryIndex`'s tie-breaking). A newer
+        /// version from anywhere still always wins over an older one
+        /// regardless of priority — this only disambiguates an exact
+        /// tie. Repositories with no explicit priority default to `0`,
+        /// so a freshly added repo with no stated opinion never silently
+        /// outranks ones an admin already tuned.
+        #[serde(default)]
+        priority: i32,
     },
 }
 
@@ -37,6 +55,28 @@ impl RepoSource {
             RepoSource::Url(_) => None,
             RepoSource::Detailed { signer, .. } => signer.as_deref(),
         }
+    }
+
+    pub fn mirrors(&self) -> &[String] {
+        match self {
+            RepoSource::Url(_) => &[],
+            RepoSource::Detailed { mirrors, .. } => mirrors,
+        }
+    }
+
+    pub fn priority(&self) -> i32 {
+        match self {
+            RepoSource::Url(_) => 0,
+            RepoSource::Detailed { priority, .. } => *priority,
+        }
+    }
+
+    /// The primary URL followed by every configured mirror, in the order
+    /// they should be tried.
+    pub fn urls(&self) -> Vec<&str> {
+        let mut all = vec![self.url()];
+        all.extend(self.mirrors().iter().map(String::as_str));
+        all
     }
 }
 
@@ -55,6 +95,14 @@ pub struct Config {
     pub trusted_keys_dir: PathBuf,
     #[serde(default)]
     pub repositories: Vec<RepoSource>,
+    /// Overrides `package::arch::host_arch()` as the architecture
+    /// installs are resolved/checked against. `None` (the default) means
+    /// "whatever CPU architecture this `mitos-pkg`/`mitos-pkgd` binary
+    /// itself is running on" — set this when that's *not* the right
+    /// answer, e.g. `mitos-installer` cross-building an AArch64 target
+    /// image from an x86_64 CI runner.
+    #[serde(default)]
+    pub target_arch: Option<String>,
     /// Where `mitos-pkgd` (see `crate::daemon`) listens, and where
     /// `DaemonClient::connect` looks by default. `#[serde(default = ...)]`
     /// so a `config.json` written before the daemon existed still loads
@@ -73,6 +121,7 @@ impl Default for Config {
             repositories: vec![RepoSource::Url(
                 "https://packages.mitos-os.org/index.json".to_string(),
             )],
+            target_arch: None,
             daemon_socket: Config::default_daemon_socket(),
         }
     }
@@ -104,6 +153,15 @@ impl Config {
 
     pub fn files_db_path(&self) -> PathBuf {
         self.db_dir.join("files.json")
+    }
+
+    /// Where `PackageService::history` reads from and every mutating
+    /// operation appends to. Lives beside `packages.json`/`files.json`
+    /// under `db_dir` rather than `cache_dir`, since — unlike the index
+    /// cache or downloaded archives — history isn't something `clean`
+    /// should ever delete.
+    pub fn history_path(&self) -> PathBuf {
+        self.db_dir.join("history.jsonl")
     }
 
     pub fn index_cache_path(&self) -> PathBuf {
